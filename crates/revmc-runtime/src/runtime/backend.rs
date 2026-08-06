@@ -39,12 +39,10 @@ use revmc_context::RawEvmCompilerFn;
 /// The resident map type: code_hash+spec_id → compiled program.
 pub(crate) type ResidentMap = DashMap<RuntimeCacheKey, Arc<CompiledProgram>, DefaultHashBuilder>;
 
-/// Bounded MPMC lock-free queue of misses and sampled resident hits.
+/// Bounded MPMC lock-free lookup-event queue.
 ///
-/// Producers (lookup hot path) push without blocking; on overflow the event
-/// is silently dropped (`stats.events_dropped` is bumped). Exact lookup
-/// counters are updated before enqueueing. The backend drains via `pop` on
-/// every loop iteration, so hotness and usage signals remain best-effort.
+/// Producers (lookup hot path) push without blocking; on overflow the event is silently dropped
+/// (`stats.events_dropped` is bumped). Exact lookup counters are updated before enqueueing.
 pub(crate) type EventQueue = ArrayQueue<LookupRequest>;
 
 /// Per-entry metadata tracked alongside the resident map for eviction decisions.
@@ -257,13 +255,17 @@ impl BackendState {
         self.inner.stats.cold_entries.store(cold_entries as u64, Ordering::Relaxed);
     }
 
-    /// Drains all currently-queued lookup events.
+    /// Drains queued misses before sampled resident hits.
     fn drain_events(&mut self) {
-        // Cap per-iteration drain so a flood of events can't starve other
-        // work (commands, worker results, sweeps). Surplus events stay in the
-        // queue and are picked up next iteration.
+        // The separate queues prevent usage bookkeeping from displacing demand-load and
+        // compilation signals. Cap each drain so a flood cannot starve commands, worker results,
+        // or sweeps; surplus events stay queued for the next iteration.
         for _ in 0..self.tuning.max_events_per_drain {
-            let Some(event) = self.inner.events.pop() else { break };
+            let Some(event) = self.inner.miss_events.pop() else { break };
+            self.handle_lookup_observed(event);
+        }
+        for _ in 0..self.tuning.max_events_per_drain {
+            let Some(event) = self.inner.hit_events.pop() else { break };
             self.handle_lookup_observed(event);
         }
     }
@@ -491,7 +493,8 @@ impl BackendState {
         }
         // Discard pending lookup events: they were observed before the clear
         // and would otherwise get processed against the new generation.
-        while self.inner.events.pop().is_some() {}
+        while self.inner.miss_events.pop().is_some() {}
+        while self.inner.hit_events.pop().is_some() {}
         // Bump generation so in-flight worker results from before the clear are discarded.
         self.generation += 1;
         debug!(generation = self.generation, "resident map cleared");
