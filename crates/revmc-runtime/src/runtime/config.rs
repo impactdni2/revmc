@@ -1,6 +1,9 @@
 //! Runtime configuration.
 
-use crate::{CompileTimings, eyre, runtime::storage::ArtifactStore};
+use crate::{
+    CompileTimings, eyre,
+    runtime::storage::{ArtifactKey, ArtifactStore},
+};
 use alloy_primitives::B256;
 use revm_context_interface::cfg::GasParams;
 use revm_primitives::hardfork::SpecId;
@@ -128,6 +131,16 @@ pub struct RuntimeConfig {
     /// Defaults to `None`.
     #[debug(skip)]
     pub on_compilation: Option<Arc<dyn Fn(CompilationEvent) + Send + Sync>>,
+
+    /// Callback invoked when a persisted AOT artifact is used.
+    ///
+    /// Resident hits may be sampled according to
+    /// [`RuntimeTuning::lookup_hit_sample_rate`]. Demand-loaded artifacts are
+    /// reported with a weight of one.
+    ///
+    /// Defaults to `None`.
+    #[debug(skip)]
+    pub on_artifact_usage: Option<Arc<dyn Fn(ArtifactUsageEvent) + Send + Sync>>,
 }
 
 /// Event emitted after a compilation attempt completes.
@@ -145,6 +158,15 @@ pub struct CompilationEvent {
     pub success: bool,
     /// Per-phase timing breakdown (translate, optimize, codegen).
     pub timings: CompileTimings,
+}
+
+/// A weighted observation that a persisted AOT artifact was used.
+#[derive(Clone, Debug)]
+pub struct ArtifactUsageEvent {
+    /// The fully qualified persisted artifact key.
+    pub artifact_key: ArtifactKey,
+    /// Number of lookups represented by this observation.
+    pub weight: u64,
 }
 
 /// The kind of compilation that was performed.
@@ -221,6 +243,7 @@ impl Default for RuntimeConfig {
             jit_helper_path: None,
             blocking: false,
             on_compilation: None,
+            on_artifact_usage: None,
         }
     }
 }
@@ -237,6 +260,13 @@ pub struct RuntimeTuning {
     ///
     /// Defaults to `4096`.
     pub max_events_per_drain: usize,
+
+    /// Sample one in every N resident hits for backend bookkeeping. `0`
+    /// disables resident-hit events while misses are still always queued.
+    ///
+    /// Lookup hit/miss counters remain exact regardless of this setting.
+    /// Defaults to `1`.
+    pub lookup_hit_sample_rate: usize,
 
     /// Maximum delay between lookup observation and hotness accounting.
     ///
@@ -363,6 +393,7 @@ impl Default for RuntimeTuning {
         Self {
             channel_capacity: 4096,
             max_events_per_drain: 4096,
+            lookup_hit_sample_rate: 1,
             event_drain_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             jit_hot_threshold: 8,

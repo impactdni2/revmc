@@ -2,7 +2,7 @@
 //!
 //! - Startup AOT preload from [`ArtifactStore::load_all`] into an immutable in-memory map.
 //! - O(1) [`JitBackend::lookup`] that only reads the resident map.
-//! - Fire-and-forget lookup-observed events to the backend thread.
+//! - Fire-and-forget miss and sampled-hit events to the backend thread.
 //! - Background JIT compilation for hot keys (threshold-based promotion).
 
 use crate::{
@@ -31,7 +31,9 @@ pub use api::{
 };
 
 mod config;
-pub use config::{CompilationEvent, CompilationKind, JitMode, RuntimeConfig, RuntimeTuning};
+pub use config::{
+    ArtifactUsageEvent, CompilationEvent, CompilationKind, JitMode, RuntimeConfig, RuntimeTuning,
+};
 
 mod backend;
 
@@ -222,21 +224,27 @@ impl JitBackend {
             return LookupDecision::Interpret(InterpretReason::Ineligible);
         }
 
-        let decision = if let Some(program_ref) = shared.resident.try_get(&req.key).try_unwrap() {
+        if let Some(program_ref) = shared.resident.try_get(&req.key).try_unwrap() {
             let program = Arc::clone(&program_ref);
             drop(program_ref);
-            req.code.clear();
+            let hit = shared.stats.lookup_hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let sample_rate = inner.tuning.lookup_hit_sample_rate;
+            if sample_rate != 0 && hit.is_multiple_of(sample_rate as u64) {
+                req.code.clear();
+                if let Err(_v) = shared.events.push(req) {
+                    cold_path();
+                    shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             LookupDecision::Compiled(program)
         } else {
+            shared.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
+            if let Err(_v) = shared.events.push(req) {
+                cold_path();
+                shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            }
             LookupDecision::Interpret(InterpretReason::NotReady)
-        };
-
-        if let Err(_v) = shared.events.push(req) {
-            cold_path();
-            shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
         }
-
-        decision
     }
 
     /// Checks the resident map for a compiled program without enqueuing an event.
