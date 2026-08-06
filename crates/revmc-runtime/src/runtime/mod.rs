@@ -86,9 +86,12 @@ pub(crate) struct BackendShared {
     /// Shared resident compiled map.
     #[debug(skip)]
     resident: ResidentMap,
-    /// Lock-free queue of events.
+    /// Lock-free queue of lookup misses.
     #[debug(skip)]
-    events: EventQueue,
+    miss_events: EventQueue,
+    /// Lock-free queue of sampled resident hits.
+    #[debug(skip)]
+    hit_events: EventQueue,
     /// Number of active out-of-process helper pauses.
     pause_depth: AtomicUsize,
     /// Shared stats counters.
@@ -178,11 +181,13 @@ impl JitBackend {
 
         let enabled = config.enabled;
         let (tx, rx) = chan::bounded::<Command>(config.tuning.channel_capacity);
-        let events = ArrayQueue::new(config.tuning.channel_capacity);
+        let miss_events = ArrayQueue::new(config.tuning.channel_capacity);
+        let hit_events = ArrayQueue::new(config.tuning.channel_capacity);
         let tuning = config.tuning;
         let shared = Arc::new(BackendShared {
             resident: ResidentMap::default(),
-            events,
+            miss_events,
+            hit_events,
             pause_depth: AtomicUsize::new(0),
             stats: Arc::new(RuntimeStats::default()),
         });
@@ -231,7 +236,7 @@ impl JitBackend {
             let sample_rate = inner.tuning.lookup_hit_sample_rate;
             if sample_rate != 0 && hit.is_multiple_of(sample_rate as u64) {
                 req.code.clear();
-                if let Err(_v) = shared.events.push(req) {
+                if let Err(_v) = shared.hit_events.push(req) {
                     cold_path();
                     shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -239,7 +244,7 @@ impl JitBackend {
             LookupDecision::Compiled(program)
         } else {
             shared.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
-            if let Err(_v) = shared.events.push(req) {
+            if let Err(_v) = shared.miss_events.push(req) {
                 cold_path();
                 shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -572,7 +577,7 @@ impl BackendShared {
     pub(crate) fn stats(&self) -> RuntimeStatsSnapshot {
         self.stats.snapshot(stats::RuntimeStatsGauges {
             resident_entries: self.resident.len() as u64,
-            events_queued: self.events.len() as u64,
+            events_queued: (self.miss_events.len() + self.hit_events.len()) as u64,
             command_queue_len: 0,
         })
     }
