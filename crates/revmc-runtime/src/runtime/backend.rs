@@ -3,7 +3,9 @@ use crate::{
     runtime::{
         LookupRequest,
         api::{CompiledProgram, LoadedLibrary, ProgramKind},
-        config::{CompilationEvent, CompilationKind, RuntimeConfig, RuntimeTuning},
+        config::{
+            ArtifactUsageEvent, CompilationEvent, CompilationKind, RuntimeConfig, RuntimeTuning,
+        },
         storage::{
             ArtifactKey, ArtifactManifest, ArtifactStore, BackendSelection, RuntimeCacheKey,
         },
@@ -37,11 +39,12 @@ use revmc_context::RawEvmCompilerFn;
 /// The resident map type: code_hash+spec_id → compiled program.
 pub(crate) type ResidentMap = DashMap<RuntimeCacheKey, Arc<CompiledProgram>, DefaultHashBuilder>;
 
-/// Bounded MPMC lock-free queue of lookup-observed events.
+/// Bounded MPMC lock-free queue of misses and sampled resident hits.
 ///
 /// Producers (lookup hot path) push without blocking; on overflow the event
-/// is silently dropped (`stats.events_dropped` is bumped). The backend
-/// drains via `pop` on every loop iteration. Hotness signal is best-effort.
+/// is silently dropped (`stats.events_dropped` is bumped). Exact lookup
+/// counters are updated before enqueueing. The backend drains via `pop` on
+/// every loop iteration, so hotness and usage signals remain best-effort.
 pub(crate) type EventQueue = ArrayQueue<LookupRequest>;
 
 /// Per-entry metadata tracked alongside the resident map for eviction decisions.
@@ -222,6 +225,8 @@ struct BackendState {
     last_sweep: Instant,
     /// Optional user callback for compilation events.
     on_compilation: Option<Arc<dyn Fn(CompilationEvent) + Send + Sync>>,
+    /// Optional user callback for sampled persisted-artifact usage.
+    on_artifact_usage: Option<Arc<dyn Fn(ArtifactUsageEvent) + Send + Sync>>,
 }
 
 impl BackendState {
@@ -266,15 +271,31 @@ impl BackendState {
     fn handle_lookup_observed(&mut self, event: LookupRequest) {
         let hit = event.code.is_empty();
         if hit {
-            self.inner.stats.lookup_hits.fetch_add(1, Ordering::Relaxed);
             if let Some(meta) = self.resident_meta.get_mut(&event.key) {
                 meta.last_hit_at = Instant::now();
             }
+            self.record_artifact_usage(event.key, self.tuning.lookup_hit_sample_rate as u64);
         } else {
-            self.inner.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
             let kind = if self.aot { CompilationKind::Aot } else { CompilationKind::Jit };
             self.try_admit(kind, event.key, event.code, SyncNotifier::none(), AdmitMode::Observed);
         }
+    }
+
+    fn record_artifact_usage(&self, key: RuntimeCacheKey, weight: u64) {
+        if !self.aot || weight == 0 {
+            return;
+        }
+        let Some(callback) = &self.on_artifact_usage else {
+            return;
+        };
+        callback(ArtifactUsageEvent {
+            artifact_key: ArtifactKey {
+                runtime: key,
+                backend: BackendSelection::Llvm,
+                opt_level: self.tuning.aot_opt_level,
+            },
+            weight,
+        });
     }
 
     fn handle_compile_jit(&mut self, req: CompileJitRequest) {
@@ -433,6 +454,7 @@ impl BackendState {
                             "loaded existing AOT artifact from store, skipping recompilation",
                         );
                         self.insert_resident(*key, Arc::new(program));
+                        self.record_artifact_usage(*key, 1);
                         true
                     }
                     Err(e) => {
@@ -854,6 +876,7 @@ pub(crate) fn run(
         generation: 0,
         last_sweep: now,
         on_compilation: config.on_compilation,
+        on_artifact_usage: config.on_artifact_usage,
     };
 
     // Tick interval is min(event_drain, sweep) so we never sleep longer than

@@ -407,10 +407,9 @@ fn sub_threshold_misses_do_not_dispatch() {
         let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
     }
 
-    // Misses are tracked asynchronously by the backend, with overflow dropped.
-    // The two together must add up to the total lookup count.
-    let stats = tb.wait_stats(|s| s.lookup_misses + s.events_dropped == 200);
-    assert_eq!(stats.lookup_misses + stats.events_dropped, 200);
+    // Lookup counters are exact even when backend bookkeeping events overflow.
+    let stats = tb.stats();
+    assert_eq!(stats.lookup_misses, 200);
     assert_eq!(stats.compilations_dispatched, 0);
 }
 
@@ -779,13 +778,8 @@ fn concurrent_lookup_same_key() {
         t.join().unwrap();
     }
 
-    let stats = tb.wait_stats(|s| s.lookup_hits + s.events_dropped >= 800);
-    assert!(
-        stats.lookup_hits + stats.events_dropped >= 800,
-        "expected ≥800 hits+dropped, got hits={} dropped={}",
-        stats.lookup_hits,
-        stats.events_dropped,
-    );
+    let stats = tb.stats();
+    assert!(stats.lookup_hits >= 800, "expected ≥800 hits, got {}", stats.lookup_hits);
 }
 
 #[test]
@@ -850,22 +844,11 @@ fn stats_accuracy_concurrent() {
     }
 
     let total_lookups = n_threads * n_lookups;
-    // Stats are updated asynchronously by the backend; on overflow events drop.
-    // Pre-existing in-flight events from trigger_jit_cancun may also slip in,
-    // so use `>=` rather than equality.
-    let after = tb.wait_stats(|s| {
-        let new_hits = s.lookup_hits - before.lookup_hits;
-        let new_dropped = s.events_dropped - before.events_dropped;
-        new_hits + new_dropped >= total_lookups
-    });
+    let after = tb.stats();
     let new_hits = after.lookup_hits - before.lookup_hits;
-    let new_dropped = after.events_dropped - before.events_dropped;
     let new_misses = after.lookup_misses - before.lookup_misses;
 
-    assert!(
-        new_hits + new_dropped >= total_lookups,
-        "all lookups should be accounted for: hits={new_hits} dropped={new_dropped} total={total_lookups}",
-    );
+    assert_eq!(new_hits, total_lookups, "all resident lookups should be counted as hits");
     assert_eq!(new_misses, 0, "all lookups should be hits");
 }
 
@@ -1000,6 +983,57 @@ fn aot_mode_promotes_misses_to_aot() {
     let p = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
     assert_eq!(p.kind, ProgramKind::Aot);
     assert_eq!(store.len(), 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn resident_hit_sampling_reports_weighted_artifact_usage() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let usage: Arc<Mutex<Vec<ArtifactUsageEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let usage2 = usage.clone();
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(store),
+        tuning: RuntimeTuning {
+            jit_hot_threshold: 1,
+            jit_worker_count: 1,
+            lookup_hit_sample_rate: 4,
+            ..Default::default()
+        },
+        on_artifact_usage: Some(Arc::new(move |event| {
+            usage2.lock().unwrap().push(event);
+        })),
+        ..Default::default()
+    });
+
+    tb.trigger_jit_cancun(BYTECODE_RET42);
+    let before = tb.stats();
+    for _ in 0..10 {
+        assert!(matches!(
+            tb.lookup(TestBackend::req_cancun(BYTECODE_RET42)),
+            LookupDecision::Compiled(_)
+        ));
+    }
+
+    poll_until(std::time::Duration::from_secs(10), || {
+        (usage.lock().unwrap().iter().map(|event| event.weight).sum::<u64>() >= 8).then_some(())
+    });
+    let after = tb.stats();
+    assert_eq!(after.lookup_hits - before.lookup_hits, 10);
+    assert_eq!(after.lookup_misses - before.lookup_misses, 0);
+
+    let captured = usage.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for event in captured.iter() {
+        assert_eq!(
+            event.artifact_key.runtime.code_hash,
+            alloy_primitives::keccak256(BYTECODE_RET42)
+        );
+        assert_eq!(event.artifact_key.runtime.spec_id, SpecId::CANCUN);
+        assert_eq!(event.artifact_key.backend, BackendSelection::Llvm);
+        assert_eq!(event.weight, 4);
+    }
 }
 
 #[test]
@@ -1269,7 +1303,8 @@ fn observed_entry_capacity_is_reported() {
         let _ = tb.lookup(TestBackend::req_cancun(&indexed_bytecode(i)));
     }
 
-    let stats = tb.wait_stats(|stats| stats.lookup_misses == 11);
+    let stats = tb.wait_stats(|stats| stats.observed_entry_rejections == 1);
+    assert_eq!(stats.lookup_misses, 11);
     assert_eq!(stats.tracked_entries, 10);
     assert_eq!(stats.cold_entries, 10);
     assert_eq!(stats.observed_entry_rejections, 1);
