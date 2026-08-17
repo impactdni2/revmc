@@ -9,6 +9,9 @@ pub(crate) struct RuntimeStats {
     pub(crate) lookup_hits: AtomicU64,
     /// Total lookups that returned interpret (not ready).
     pub(crate) lookup_misses: AtomicU64,
+    /// Total resident lookups that fell back to interpretation because the
+    /// target DashMap shard was locked.
+    pub(crate) resident_lookup_locked: AtomicU64,
     /// Total lookup events dropped due to event-queue overflow.
     pub(crate) events_dropped: AtomicU64,
     /// Total observed entries rejected because the cold-entry tracking table was full.
@@ -19,6 +22,24 @@ pub(crate) struct RuntimeStats {
     pub(crate) cold_entries: AtomicU64,
     /// Total stale cold entries forgotten by idle eviction.
     pub(crate) cold_entry_evictions: AtomicU64,
+    /// Total point probes of persisted AOT storage.
+    pub(crate) persisted_aot_probes: AtomicU64,
+    /// Total point probes that found no persisted AOT artifact.
+    pub(crate) persisted_aot_probe_misses: AtomicU64,
+    /// Total persisted AOT artifacts successfully demand-loaded.
+    pub(crate) persisted_aot_loads: AtomicU64,
+    /// Aggregate nanoseconds spent demand-loading persisted AOT artifacts.
+    pub(crate) persisted_aot_load_ns: AtomicU64,
+    /// Total demand admissions deferred by the persisted-AOT rate limiter.
+    pub(crate) persisted_aot_rate_limited: AtomicU64,
+    /// Total AOT admissions deferred because no eligible eviction plan could
+    /// satisfy the hard resident budgets.
+    pub(crate) persisted_aot_capacity_deferred: AtomicU64,
+    /// Total persisted AOT candidates rejected because the artifact alone
+    /// exceeded the configured byte budget.
+    pub(crate) persisted_aot_oversized: AtomicU64,
+    /// Total resident AOT mappings evicted to admit another AOT artifact.
+    pub(crate) aot_evictions: AtomicU64,
     /// Total control commands dropped because the command channel was full.
     pub(crate) commands_dropped: AtomicU64,
     /// Total number of entries evicted (idle + budget).
@@ -57,6 +78,8 @@ pub(crate) struct RuntimeStats {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RuntimeStatsGauges {
     pub(crate) resident_entries: u64,
+    pub(crate) resident_aot_entries: u64,
+    pub(crate) resident_aot_artifact_bytes: u64,
     pub(crate) events_queued: u64,
     pub(crate) command_queue_len: u64,
 }
@@ -68,6 +91,8 @@ pub struct RuntimeStatsSnapshot {
     pub lookup_hits: u64,
     /// Total lookups that returned interpret (not ready).
     pub lookup_misses: u64,
+    /// Total resident lookups that encountered a locked DashMap shard.
+    pub resident_lookup_locked: u64,
     /// Total lookup events dropped due to event-queue overflow.
     pub events_dropped: u64,
     /// Total observed entries rejected because the cold-entry tracking table was full.
@@ -78,6 +103,28 @@ pub struct RuntimeStatsSnapshot {
     pub cold_entries: u64,
     /// Total stale cold entries forgotten by idle eviction.
     pub cold_entry_evictions: u64,
+    /// Number of resident AOT programs.
+    pub resident_aot_entries: u64,
+    /// Aggregate artifact-file length represented by resident AOT programs.
+    ///
+    /// This is a stable budget proxy and is not an exact RSS measurement.
+    pub resident_aot_artifact_bytes: u64,
+    /// Total point probes of persisted AOT storage.
+    pub persisted_aot_probes: u64,
+    /// Total point probes that found no persisted AOT artifact.
+    pub persisted_aot_probe_misses: u64,
+    /// Total persisted AOT artifacts successfully demand-loaded.
+    pub persisted_aot_loads: u64,
+    /// Aggregate nanoseconds spent demand-loading persisted AOT artifacts.
+    pub persisted_aot_load_ns: u64,
+    /// Total demand admissions deferred by the persisted-AOT rate limiter.
+    pub persisted_aot_rate_limited: u64,
+    /// Total AOT admissions deferred by resident capacity.
+    pub persisted_aot_capacity_deferred: u64,
+    /// Total persisted AOT candidates rejected as individually oversized.
+    pub persisted_aot_oversized: u64,
+    /// Total resident AOT mappings evicted by the AOT admission policy.
+    pub aot_evictions: u64,
     /// Total control commands dropped because the command channel was full.
     ///
     /// Pause/resume commands are best-effort and dropped instead of blocking the caller when
@@ -157,11 +204,24 @@ impl RuntimeStats {
         RuntimeStatsSnapshot {
             lookup_hits: self.lookup_hits.load(Ordering::Relaxed),
             lookup_misses: self.lookup_misses.load(Ordering::Relaxed),
+            resident_lookup_locked: self.resident_lookup_locked.load(Ordering::Relaxed),
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
             observed_entry_rejections: self.observed_entry_rejections.load(Ordering::Relaxed),
             tracked_entries: self.tracked_entries.load(Ordering::Relaxed),
             cold_entries: self.cold_entries.load(Ordering::Relaxed),
             cold_entry_evictions: self.cold_entry_evictions.load(Ordering::Relaxed),
+            resident_aot_entries: gauges.resident_aot_entries,
+            resident_aot_artifact_bytes: gauges.resident_aot_artifact_bytes,
+            persisted_aot_probes: self.persisted_aot_probes.load(Ordering::Relaxed),
+            persisted_aot_probe_misses: self.persisted_aot_probe_misses.load(Ordering::Relaxed),
+            persisted_aot_loads: self.persisted_aot_loads.load(Ordering::Relaxed),
+            persisted_aot_load_ns: self.persisted_aot_load_ns.load(Ordering::Relaxed),
+            persisted_aot_rate_limited: self.persisted_aot_rate_limited.load(Ordering::Relaxed),
+            persisted_aot_capacity_deferred: self
+                .persisted_aot_capacity_deferred
+                .load(Ordering::Relaxed),
+            persisted_aot_oversized: self.persisted_aot_oversized.load(Ordering::Relaxed),
+            aot_evictions: self.aot_evictions.load(Ordering::Relaxed),
             commands_dropped: self.commands_dropped.load(Ordering::Relaxed),
             resident_entries: gauges.resident_entries,
             events_queued: gauges.events_queued,
