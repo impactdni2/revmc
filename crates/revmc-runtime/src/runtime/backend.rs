@@ -340,17 +340,20 @@ impl BackendState {
             return;
         }
 
+        // Persisted AOT artifacts are already compiled and do not consume observed-entry or
+        // worker capacity. Probe the store before bounding new observed state so a saturated
+        // cold-entry table cannot strand a reusable artifact on disk.
+        if kind == CompilationKind::Aot && self.try_load_persisted_aot(&key) {
+            sync_notifier.notify();
+            return;
+        }
+
         if matches!(mode, AdmitMode::Observed) {
             let max_entries = self.tuning.jit_max_pending_jobs * 10;
             if !self.entries.contains_key(&key) && self.entries.len() >= max_entries {
                 self.inner.stats.observed_entry_rejections.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        }
-
-        if kind == CompilationKind::Aot && self.try_load_persisted_aot(&key) {
-            sync_notifier.notify();
-            return;
         }
 
         let now = Instant::now();
