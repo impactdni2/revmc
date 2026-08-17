@@ -8,6 +8,7 @@ use crate::{
         },
         storage::{
             ArtifactKey, ArtifactManifest, ArtifactStore, BackendSelection, RuntimeCacheKey,
+            StoredArtifact,
         },
         worker::{
             AotSuccess, CompileJob, JitCodeBacking, JitObjectSuccess, SyncNotifier, WorkerPool,
@@ -28,7 +29,7 @@ use std::{
     mem,
     ops::ControlFlow,
     sync::{Arc, atomic::Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "llvm")]
@@ -49,6 +50,114 @@ pub(crate) type EventQueue = ArrayQueue<LookupRequest>;
 struct ResidentMeta {
     /// When this entry was last hit by a lookup.
     last_hit_at: Instant,
+    /// Whether this resident program is AOT or JIT.
+    kind: ProgramKind,
+    /// Persisted artifact-file length for AOT programs. JIT programs use zero.
+    artifact_len: usize,
+}
+
+/// Cached persisted-artifact state for one observed key.
+#[derive(Clone, Debug)]
+enum PersistedAotState {
+    /// The hotness threshold has not been reached, so storage has not been touched.
+    Unprobed,
+    /// Storage was probed and contained no usable artifact. The key may be compiled.
+    Absent,
+    /// Metadata for an artifact that can be retried without another store access.
+    Ready(StoredArtifact),
+    /// The artifact can never fit within the configured byte budget.
+    Oversized,
+}
+
+/// One resident AOT entry considered by the deterministic admission planner.
+#[derive(Clone, Copy, Debug)]
+struct AotResident {
+    key: RuntimeCacheKey,
+    last_hit_at: Instant,
+    artifact_len: usize,
+}
+
+/// Result of checking hard AOT budgets and selecting LRU victims.
+#[derive(Debug, PartialEq, Eq)]
+enum AotAdmissionPlan {
+    Admit(Vec<RuntimeCacheKey>),
+    CapacityDeferred,
+    Oversized,
+}
+
+/// Plans the minimum deterministic AOT eviction set needed for one admission.
+///
+/// Artifact length is used as a stable budget proxy; it is not exact process RSS.
+fn plan_aot_admission(
+    tuning: RuntimeTuning,
+    resident_aot_entries: usize,
+    resident_aot_bytes: usize,
+    candidate_len: usize,
+    now: Instant,
+    mode: AdmitMode,
+    mut residents: Vec<AotResident>,
+) -> AotAdmissionPlan {
+    if tuning.max_resident_aot_bytes > 0 && candidate_len > tuning.max_resident_aot_bytes {
+        return AotAdmissionPlan::Oversized;
+    }
+
+    let entries_fit = |entries: usize| {
+        tuning.max_resident_aot_entries == 0 || entries <= tuning.max_resident_aot_entries
+    };
+    let bytes_fit =
+        |bytes: usize| tuning.max_resident_aot_bytes == 0 || bytes <= tuning.max_resident_aot_bytes;
+
+    let mut projected_entries = resident_aot_entries.saturating_add(1);
+    let mut projected_bytes = resident_aot_bytes.saturating_add(candidate_len);
+    if entries_fit(projected_entries) && bytes_fit(projected_bytes) {
+        return AotAdmissionPlan::Admit(Vec::new());
+    }
+
+    if mode == AdmitMode::Observed {
+        residents
+            .retain(|entry| now.duration_since(entry.last_hit_at) >= tuning.resident_aot_min_idle);
+    }
+    residents.sort_unstable_by(|a, b| {
+        a.last_hit_at
+            .cmp(&b.last_hit_at)
+            .then_with(|| a.key.code_hash.cmp(&b.key.code_hash))
+            .then_with(|| (a.key.spec_id as u8).cmp(&(b.key.spec_id as u8)))
+    });
+
+    let mut victims = Vec::new();
+    for resident in residents {
+        projected_entries = projected_entries.saturating_sub(1);
+        projected_bytes = projected_bytes.saturating_sub(resident.artifact_len);
+        victims.push(resident.key);
+        if entries_fit(projected_entries) && bytes_fit(projected_bytes) {
+            return AotAdmissionPlan::Admit(victims);
+        }
+    }
+    AotAdmissionPlan::CapacityDeferred
+}
+
+/// No-burst demand-load limiter. Successful acquisitions always schedule from
+/// `now`, so idle time never accumulates future capacity.
+#[derive(Debug, Default)]
+struct AotLoadLimiter {
+    next_allowed_at: Option<Instant>,
+}
+
+impl AotLoadLimiter {
+    fn try_acquire(&mut self, now: Instant, interval: Duration) -> bool {
+        if interval.is_zero() {
+            return true;
+        }
+        if self.next_allowed_at.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.next_allowed_at = Some(now + interval);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.next_allowed_at = None;
+    }
 }
 
 /// Returns the total bytes of JIT-allocated memory via the memory plugin.
@@ -175,6 +284,12 @@ struct EntryState {
     last_observed_at: Instant,
     /// Sync notifiers waiting for this entry to finish compiling.
     pending_notifiers: Vec<SyncNotifier>,
+    /// Cached persisted-AOT probe/admission state.
+    persisted_aot: PersistedAotState,
+    /// Whether this entry consumes one slot in `max_observed_entries`.
+    observed: bool,
+    /// Admission semantics to use when an in-flight AOT compilation completes.
+    working_mode: AdmitMode,
 }
 
 /// Phase of a backend entry.
@@ -195,6 +310,15 @@ enum AdmitMode {
     Explicit,
 }
 
+/// Result of trying to publish one cached persisted AOT artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AotAdmissionOutcome {
+    Loaded,
+    Deferred,
+    Oversized,
+    LoadFailed,
+}
+
 /// All backend-thread-owned mutable state.
 struct BackendState {
     /// Shared state (resident map, event queue, stats).
@@ -203,6 +327,14 @@ struct BackendState {
     resident_meta: HashMap<RuntimeCacheKey, ResidentMeta>,
     /// Per-key tracking state (backend-only).
     entries: HashMap<RuntimeCacheKey, EntryState>,
+    /// Number of entries created by observed misses.
+    observed_entries: usize,
+    /// Number of resident AOT programs.
+    resident_aot_entries: usize,
+    /// Aggregate artifact-file bytes represented by resident AOT programs.
+    resident_aot_bytes: usize,
+    /// Demand-load rate limiter.
+    aot_load_limiter: AotLoadLimiter,
     /// Worker pool for JIT compilation.
     workers: WorkerPool,
     /// Backend-thread-owned linker for out-of-process JIT objects.
@@ -340,42 +472,93 @@ impl BackendState {
             return;
         }
 
-        // Persisted AOT artifacts are already compiled and do not consume observed-entry or
-        // worker capacity. Probe the store before bounding new observed state so a saturated
-        // cold-entry table cannot strand a reusable artifact on disk.
-        if kind == CompilationKind::Aot && self.try_load_persisted_aot(&key) {
-            sync_notifier.notify();
-            return;
-        }
-
-        if matches!(mode, AdmitMode::Observed) {
-            let max_entries = self.tuning.jit_max_pending_jobs * 10;
-            if !self.entries.contains_key(&key) && self.entries.len() >= max_entries {
+        let now = Instant::now();
+        if mode == AdmitMode::Observed {
+            let needs_observed_slot = self.entries.get(&key).is_none_or(|entry| !entry.observed);
+            if needs_observed_slot
+                && (self.tuning.max_observed_entries == 0
+                    || self.observed_entries >= self.tuning.max_observed_entries)
+            {
                 self.inner.stats.observed_entry_rejections.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
 
-        let now = Instant::now();
         let entry = self.entries.entry(key).or_insert_with(|| EntryState {
             hotness: 0,
             phase: EntryPhase::Cold,
             bytecode: bytecode.clone(),
             last_observed_at: now,
             pending_notifiers: Vec::new(),
+            persisted_aot: PersistedAotState::Unprobed,
+            observed: false,
+            working_mode: mode,
         });
+        if mode == AdmitMode::Observed && !entry.observed {
+            entry.observed = true;
+            self.observed_entries += 1;
+        }
         entry.last_observed_at = now;
 
         if entry.phase == EntryPhase::Working {
+            if mode == AdmitMode::Explicit {
+                entry.working_mode = AdmitMode::Explicit;
+            }
             entry.pending_notifiers.push(sync_notifier);
             return;
         }
 
-        if matches!(mode, AdmitMode::Observed) {
+        if mode == AdmitMode::Observed {
             entry.hotness = entry.hotness.saturating_add(1);
-            if (entry.hotness as usize) < self.tuning.jit_hot_threshold {
-                return;
+        }
+
+        if kind == CompilationKind::Aot {
+            let should_probe = mode == AdmitMode::Explicit
+                || (entry.hotness as usize) >= self.tuning.persisted_aot_hot_threshold;
+            if matches!(entry.persisted_aot, PersistedAotState::Unprobed) && should_probe {
+                let persisted_aot = self.probe_persisted_aot(&key);
+                self.entries.get_mut(&key).unwrap().persisted_aot = persisted_aot;
             }
+
+            let persisted_aot = self.entries.get(&key).unwrap().persisted_aot.clone();
+            match persisted_aot {
+                PersistedAotState::Unprobed => return,
+                PersistedAotState::Oversized => {
+                    sync_notifier.notify();
+                    return;
+                }
+                PersistedAotState::Ready(stored) => {
+                    match self.try_admit_stored_aot(key, &stored, mode, now, true) {
+                        AotAdmissionOutcome::Loaded => {
+                            self.remove_entry(&key);
+                            sync_notifier.notify();
+                            return;
+                        }
+                        AotAdmissionOutcome::Deferred => {
+                            sync_notifier.notify();
+                            return;
+                        }
+                        AotAdmissionOutcome::Oversized => {
+                            self.entries.get_mut(&key).unwrap().persisted_aot =
+                                PersistedAotState::Oversized;
+                            sync_notifier.notify();
+                            return;
+                        }
+                        AotAdmissionOutcome::LoadFailed => {
+                            // Avoid repeatedly probing/loading the broken file. A subsequent
+                            // compilation will overwrite it in the artifact store.
+                            self.entries.get_mut(&key).unwrap().persisted_aot =
+                                PersistedAotState::Absent;
+                        }
+                    }
+                }
+                PersistedAotState::Absent => {}
+            }
+        }
+
+        let entry = self.entries.get_mut(&key).unwrap();
+        if mode == AdmitMode::Observed && (entry.hotness as usize) < self.tuning.jit_hot_threshold {
+            return;
         }
 
         if self.pending_jobs >= self.tuning.jit_max_pending_jobs {
@@ -413,6 +596,7 @@ impl BackendState {
                     "dispatched compilation",
                 );
                 entry.phase = EntryPhase::Working;
+                entry.working_mode = mode;
                 self.pending_jobs += 1;
                 self.inner.stats.compilations_dispatched.fetch_add(1, Ordering::Relaxed);
             }
@@ -423,77 +607,159 @@ impl BackendState {
         }
     }
 
-    /// Tries to load an already-persisted AOT artifact from the store into the resident map.
-    /// Returns `true` if the artifact was loaded successfully.
-    fn try_load_persisted_aot(&mut self, key: &RuntimeCacheKey) -> bool {
+    /// Probes persisted AOT storage once and returns cacheable tri-state metadata.
+    fn probe_persisted_aot(&self, key: &RuntimeCacheKey) -> PersistedAotState {
         let store = match &self.store {
-            Some(s) => s,
-            None => return false,
+            Some(store) => store,
+            None => return PersistedAotState::Absent,
         };
-
         let artifact_key = ArtifactKey {
             runtime: *key,
             backend: BackendSelection::Llvm,
             opt_level: self.tuning.aot_opt_level,
         };
-
+        self.inner.stats.persisted_aot_probes.fetch_add(1, Ordering::Relaxed);
         match store.load(&artifact_key) {
             Ok(Some(stored)) => {
-                match (|| -> eyre::Result<CompiledProgram> {
-                    let library = unsafe { libloading::Library::new(&stored.dylib_path) }
-                        .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
-                    let func: EvmCompilerFn = unsafe {
-                        let sym: libloading::Symbol<'_, EvmCompilerFn> =
-                            library.get(stored.manifest.symbol_name.as_bytes()).map_err(|e| {
-                                eyre::eyre!("symbol '{}': {e}", stored.manifest.symbol_name)
-                            })?;
-                        *sym
-                    };
-                    let library = Arc::new(LoadedLibrary::new(library));
-                    Ok(CompiledProgram::new_aot(*key, func, library))
-                })() {
-                    Ok(program) => {
-                        debug!(
-                            code_hash = %key.code_hash,
-                            spec_id = ?key.spec_id,
-                            "loaded existing AOT artifact from store, skipping recompilation",
-                        );
-                        self.insert_resident(*key, Arc::new(program));
-                        self.record_artifact_usage(*key, 1);
-                        true
-                    }
-                    Err(e) => {
-                        warn!(
-                            code_hash = %key.code_hash,
-                            error = %e,
-                            "failed to load persisted AOT artifact, will recompile",
-                        );
-                        false
-                    }
+                if self.tuning.max_resident_aot_bytes > 0
+                    && stored.manifest.artifact_len > self.tuning.max_resident_aot_bytes
+                {
+                    self.inner.stats.persisted_aot_oversized.fetch_add(1, Ordering::Relaxed);
+                    PersistedAotState::Oversized
+                } else {
+                    PersistedAotState::Ready(stored)
                 }
             }
-            Ok(None) => false,
-            Err(e) => {
+            Ok(None) => {
+                self.inner.stats.persisted_aot_probe_misses.fetch_add(1, Ordering::Relaxed);
+                PersistedAotState::Absent
+            }
+            Err(error) => {
                 warn!(
                     code_hash = %key.code_hash,
-                    error = %e,
-                    "failed to probe artifact store",
+                    error = %error,
+                    "failed to probe artifact store; recompilation remains available",
                 );
-                false
+                PersistedAotState::Absent
             }
         }
+    }
+
+    /// Attempts to load and publish cached persisted AOT metadata under the
+    /// configured hard budgets and demand-admission policy.
+    fn try_admit_stored_aot(
+        &mut self,
+        key: RuntimeCacheKey,
+        stored: &StoredArtifact,
+        mode: AdmitMode,
+        now: Instant,
+        persisted_candidate: bool,
+    ) -> AotAdmissionOutcome {
+        let residents = self
+            .resident_meta
+            .iter()
+            .filter(|(_, meta)| meta.kind == ProgramKind::Aot)
+            .map(|(key, meta)| AotResident {
+                key: *key,
+                last_hit_at: meta.last_hit_at,
+                artifact_len: meta.artifact_len,
+            })
+            .collect();
+        let victims = match plan_aot_admission(
+            self.tuning,
+            self.resident_aot_entries,
+            self.resident_aot_bytes,
+            stored.manifest.artifact_len,
+            now,
+            mode,
+            residents,
+        ) {
+            AotAdmissionPlan::Admit(victims) => victims,
+            AotAdmissionPlan::CapacityDeferred => {
+                self.inner.stats.persisted_aot_capacity_deferred.fetch_add(1, Ordering::Relaxed);
+                return AotAdmissionOutcome::Deferred;
+            }
+            AotAdmissionPlan::Oversized => {
+                self.inner.stats.persisted_aot_oversized.fetch_add(1, Ordering::Relaxed);
+                return AotAdmissionOutcome::Oversized;
+            }
+        };
+
+        if persisted_candidate
+            && mode == AdmitMode::Observed
+            && !self.aot_load_limiter.try_acquire(now, self.tuning.persisted_aot_load_interval)
+        {
+            self.inner.stats.persisted_aot_rate_limited.fetch_add(1, Ordering::Relaxed);
+            return AotAdmissionOutcome::Deferred;
+        }
+
+        let load_started = Instant::now();
+        let program = match Self::load_aot_program(key, stored) {
+            Ok(program) => program,
+            Err(error) => {
+                warn!(
+                    code_hash = %key.code_hash,
+                    error = %error,
+                    "failed to load persisted AOT artifact; recompilation remains available",
+                );
+                return AotAdmissionOutcome::LoadFailed;
+            }
+        };
+        let load_ns = load_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+        // Dlopen happens before eviction so a load failure cannot create a cache hole.
+        for victim in victims {
+            self.remove_resident(&victim);
+            self.remove_entry(&victim);
+            self.inner.stats.aot_evictions.fetch_add(1, Ordering::Relaxed);
+            self.inner.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        self.insert_resident(key, Arc::new(program));
+        if persisted_candidate {
+            self.record_artifact_usage(key, 1);
+        }
+        if persisted_candidate && mode == AdmitMode::Observed {
+            self.inner.stats.persisted_aot_loads.fetch_add(1, Ordering::Relaxed);
+            self.inner.stats.persisted_aot_load_ns.fetch_add(load_ns, Ordering::Relaxed);
+        }
+        AotAdmissionOutcome::Loaded
+    }
+
+    fn load_aot_program(
+        key: RuntimeCacheKey,
+        stored: &StoredArtifact,
+    ) -> eyre::Result<CompiledProgram> {
+        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
+            .map_err(|error| eyre::eyre!("dlopen {:?}: {error}", stored.dylib_path))?;
+        let func: EvmCompilerFn = unsafe {
+            let symbol: libloading::Symbol<'_, EvmCompilerFn> =
+                library.get(stored.manifest.symbol_name.as_bytes()).map_err(|error| {
+                    eyre::eyre!("symbol '{}': {error}", stored.manifest.symbol_name)
+                })?;
+            *symbol
+        };
+        Ok(CompiledProgram::new_aot(
+            key,
+            func,
+            Arc::new(LoadedLibrary::new(library)),
+            stored.manifest.artifact_len,
+        ))
     }
 
     fn handle_clear_resident(&mut self) {
         self.workers.cancel_in_flight();
         self.inner.resident.clear();
         self.resident_meta.clear();
+        self.resident_aot_entries = 0;
+        self.resident_aot_bytes = 0;
+        self.aot_load_limiter.reset();
         // Notify any pending sync callers before clearing entries.
         for (_, entry) in self.entries.drain() {
             for n in entry.pending_notifiers {
                 n.notify();
             }
         }
+        self.observed_entries = 0;
         // Discard pending lookup events: they were observed before the clear
         // and would otherwise get processed against the new generation.
         while self.inner.miss_events.pop().is_some() {}
@@ -519,13 +785,36 @@ impl BackendState {
     }
 
     fn insert_resident(&mut self, key: RuntimeCacheKey, program: Arc<CompiledProgram>) {
+        if self.resident_meta.contains_key(&key) {
+            self.remove_resident(&key);
+        }
+        let kind = program.kind;
+        let artifact_len = program.artifact_len;
+        if kind == ProgramKind::Aot {
+            self.resident_aot_entries = self.resident_aot_entries.saturating_add(1);
+            self.resident_aot_bytes = self.resident_aot_bytes.saturating_add(artifact_len);
+        }
         self.inner.resident.insert(key, program);
-        self.resident_meta.insert(key, ResidentMeta { last_hit_at: Instant::now() });
+        self.resident_meta
+            .insert(key, ResidentMeta { last_hit_at: Instant::now(), kind, artifact_len });
     }
 
     fn remove_resident(&mut self, key: &RuntimeCacheKey) {
         self.inner.resident.remove(key);
-        self.resident_meta.remove(key);
+        if let Some(meta) = self.resident_meta.remove(key)
+            && meta.kind == ProgramKind::Aot
+        {
+            self.resident_aot_entries = self.resident_aot_entries.saturating_sub(1);
+            self.resident_aot_bytes = self.resident_aot_bytes.saturating_sub(meta.artifact_len);
+        }
+    }
+
+    fn remove_entry(&mut self, key: &RuntimeCacheKey) -> Option<EntryState> {
+        let entry = self.entries.remove(key)?;
+        if entry.observed {
+            self.observed_entries = self.observed_entries.saturating_sub(1);
+        }
+        Some(entry)
     }
 
     fn handle_worker_result(&mut self, result: WorkerResult) {
@@ -553,7 +842,7 @@ impl BackendState {
                 current_gen = self.generation,
                 "discarding stale worker result",
             );
-            self.entries.remove(&result.key);
+            self.remove_entry(&result.key);
             notify();
             return;
         }
@@ -577,7 +866,7 @@ impl BackendState {
                 let program =
                     Arc::new(CompiledProgram::new_jit(result.key, success.func, success.backing));
                 self.insert_resident(result.key, program);
-                self.entries.remove(&result.key);
+                self.remove_entry(&result.key);
                 self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
 
                 debug!(
@@ -594,7 +883,7 @@ impl BackendState {
                 self.handle_jit_object_success(result.key, success, result.compile_duration);
             }
             Err(err) => {
-                self.entries.remove(&result.key);
+                self.remove_entry(&result.key);
                 self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
 
                 warn!(
@@ -619,7 +908,7 @@ impl BackendState {
             Ok((func, backing)) => {
                 let program = Arc::new(CompiledProgram::new_jit(key, func, backing));
                 self.insert_resident(key, program);
-                self.entries.remove(&key);
+                self.remove_entry(&key);
                 self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
 
                 debug!(
@@ -631,7 +920,7 @@ impl BackendState {
                 );
             }
             Err(err) => {
-                self.entries.remove(&key);
+                self.remove_entry(&key);
                 self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
 
                 warn!(
@@ -645,6 +934,8 @@ impl BackendState {
     }
 
     fn handle_aot_success(&mut self, key: RuntimeCacheKey, success: AotSuccess) {
+        let mode =
+            self.entries.get(&key).map(|entry| entry.working_mode).unwrap_or(AdmitMode::Explicit);
         let artifact_key = ArtifactKey {
             runtime: key,
             backend: BackendSelection::Llvm,
@@ -665,91 +956,85 @@ impl BackendState {
             content_hash,
         };
 
-        // Persist to store if available.
-        if let Some(store) = &self.store {
-            if let Err(e) = store.store(&artifact_key, &manifest, &success.dylib_bytes) {
-                warn!(
-                    code_hash = %key.code_hash,
-                    error = %e,
-                    "failed to persist AOT artifact",
-                );
-                self.entries.remove(&key);
-                self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            debug!(
-                code_hash = %key.code_hash,
-                spec_id = ?key.spec_id,
-                dylib_len = success.dylib_bytes.len(),
-                "AOT artifact persisted to store",
-            );
-
-            // Load from store to get the canonical path, then dlopen.
-            match store.load(&artifact_key) {
-                Ok(Some(stored)) => {
-                    match (|| -> eyre::Result<CompiledProgram> {
-                        let library = unsafe { libloading::Library::new(&stored.dylib_path) }
-                            .map_err(|e| eyre::eyre!("dlopen {:?}: {e}", stored.dylib_path))?;
-                        let func: EvmCompilerFn = unsafe {
-                            let sym: libloading::Symbol<'_, EvmCompilerFn> =
-                                library.get(success.symbol_name.as_bytes()).map_err(|e| {
-                                    eyre::eyre!("symbol '{}': {e}", success.symbol_name)
-                                })?;
-                            *sym
-                        };
-                        let library = Arc::new(LoadedLibrary::new(library));
-                        Ok(CompiledProgram::new_aot(key, func, library))
-                    })() {
-                        Ok(program) => {
-                            self.insert_resident(key, Arc::new(program));
-                            self.entries.remove(&key);
-                            self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
-
-                            debug!(
-                                code_hash = %key.code_hash,
-                                spec_id = ?key.spec_id,
-                                "AOT program loaded into resident map",
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                code_hash = %key.code_hash,
-                                error = %e,
-                                "failed to load persisted AOT artifact",
-                            );
-                            // Persisted successfully but couldn't load — remove so JIT can retry.
-                            self.entries.remove(&key);
-                            self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    warn!(
-                        code_hash = %key.code_hash,
-                        "stored AOT artifact not found on reload",
-                    );
-                    self.entries.remove(&key);
-                    self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!(
-                        code_hash = %key.code_hash,
-                        error = %e,
-                        "failed to reload persisted AOT artifact",
-                    );
-                    self.entries.remove(&key);
-                    self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            // No store configured — can't persist, remove so JIT can retry.
+        let Some(store) = self.store.clone() else {
             warn!(
                 code_hash = %key.code_hash,
                 "AOT compilation completed but no artifact store configured",
             );
-            self.entries.remove(&key);
+            self.remove_entry(&key);
             self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        // Persist before applying resident budgets. A deferred artifact remains reusable on disk.
+        if let Err(error) = store.store(&artifact_key, &manifest, &success.dylib_bytes) {
+            warn!(
+                code_hash = %key.code_hash,
+                error = %error,
+                "failed to persist AOT artifact",
+            );
+            self.remove_entry(&key);
+            self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        debug!(
+            code_hash = %key.code_hash,
+            spec_id = ?key.spec_id,
+            dylib_len = success.dylib_bytes.len(),
+            "AOT artifact persisted to store",
+        );
+
+        let stored = match store.load(&artifact_key) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                warn!(code_hash = %key.code_hash, "stored AOT artifact not found on reload");
+                self.remove_entry(&key);
+                self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    code_hash = %key.code_hash,
+                    error = %error,
+                    "failed to reload persisted AOT artifact",
+                );
+                self.remove_entry(&key);
+                self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.phase = EntryPhase::Cold;
+            entry.persisted_aot = PersistedAotState::Ready(stored.clone());
+        }
+
+        match self.try_admit_stored_aot(key, &stored, mode, Instant::now(), false) {
+            AotAdmissionOutcome::Loaded => {
+                self.remove_entry(&key);
+                self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    code_hash = %key.code_hash,
+                    spec_id = ?key.spec_id,
+                    "AOT program loaded into resident map",
+                );
+            }
+            AotAdmissionOutcome::Deferred => {
+                // The ready metadata remains cached and will be retried on a later miss.
+                self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+            AotAdmissionOutcome::Oversized => {
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.persisted_aot = PersistedAotState::Oversized;
+                }
+                self.inner.stats.compilations_succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+            AotAdmissionOutcome::LoadFailed => {
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.persisted_aot = PersistedAotState::Absent;
+                }
+                self.inner.stats.compilations_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -782,25 +1067,31 @@ impl BackendState {
                     "evicting idle entry",
                 );
                 self.remove_resident(key);
-                self.entries.remove(key);
+                self.remove_entry(key);
                 self.inner.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         // Phase 2: evict stale cold entries that never became hot enough to compile.
         if let Some(idle) = cold_idle_duration {
-            let resident = &self.inner.resident;
-            let before = self.entries.len();
-            self.entries.retain(|key, entry| {
-                let stale = entry.phase == EntryPhase::Cold
-                    && now.duration_since(entry.last_observed_at) > idle
-                    && !resident.contains_key(key);
-                !stale
-            });
+            let stale_keys = self
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    entry.phase == EntryPhase::Cold
+                        && now.duration_since(entry.last_observed_at) > idle
+                        && !matches!(entry.persisted_aot, PersistedAotState::Oversized)
+                        && !self.inner.resident.contains_key(key)
+                })
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>();
+            for key in &stale_keys {
+                self.remove_entry(key);
+            }
             self.inner
                 .stats
                 .cold_entry_evictions
-                .fetch_add((before - self.entries.len()) as u64, Ordering::Relaxed);
+                .fetch_add(stale_keys.len() as u64, Ordering::Relaxed);
         }
 
         // Phase 3: enforce memory budget by evicting LRU JIT entries.
@@ -810,9 +1101,7 @@ impl BackendState {
             let mut entries: Vec<(RuntimeCacheKey, Instant)> = self
                 .resident_meta
                 .iter()
-                .filter(|(key, _)| {
-                    self.inner.resident.get(key).is_some_and(|p| matches!(p.kind, ProgramKind::Jit))
-                })
+                .filter(|(_, meta)| meta.kind == ProgramKind::Jit)
                 .map(|(key, meta)| (*key, meta.last_hit_at))
                 .collect();
             entries.sort_by_key(|(_, t)| *t);
@@ -827,7 +1116,7 @@ impl BackendState {
                     "evicting entry to stay within memory budget",
                 );
                 self.remove_resident(&key);
-                self.entries.remove(&key);
+                self.remove_entry(&key);
                 self.inner.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -864,14 +1153,26 @@ pub(crate) fn run(
     // Seed resident metadata from startup-preloaded AOT entries.
     let now = Instant::now();
     let mut preload_meta = HashMap::default();
+    let mut resident_aot_entries = 0usize;
+    let mut resident_aot_bytes = 0usize;
     for entry in inner.resident.iter() {
-        preload_meta.insert(*entry.key(), ResidentMeta { last_hit_at: now });
+        let kind = entry.kind;
+        let artifact_len = entry.artifact_len;
+        if kind == ProgramKind::Aot {
+            resident_aot_entries = resident_aot_entries.saturating_add(1);
+            resident_aot_bytes = resident_aot_bytes.saturating_add(artifact_len);
+        }
+        preload_meta.insert(*entry.key(), ResidentMeta { last_hit_at: now, kind, artifact_len });
     }
 
     let mut state = BackendState {
         inner,
         resident_meta: preload_meta,
         entries: HashMap::default(),
+        observed_entries: 0,
+        resident_aot_entries,
+        resident_aot_bytes,
+        aot_load_limiter: AotLoadLimiter::default(),
         workers,
         jit_object_linker: JitObjectLinker::new(),
         result_rx,
@@ -963,5 +1264,105 @@ mod tests {
         let (_second_func, _second_backing) = linker
             .link(&success2)
             .expect("same symbol should link while previous backing remains alive");
+    }
+}
+
+#[cfg(test)]
+mod admission_policy_tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use revm_primitives::hardfork::SpecId;
+
+    fn key(last_byte: u8) -> RuntimeCacheKey {
+        RuntimeCacheKey { code_hash: B256::with_last_byte(last_byte), spec_id: SpecId::CANCUN }
+    }
+
+    fn resident(key: RuntimeCacheKey, last_hit_at: Instant, artifact_len: usize) -> AotResident {
+        AotResident { key, last_hit_at, artifact_len }
+    }
+
+    #[test]
+    fn entry_and_byte_budgets_are_independent() {
+        let now = Instant::now();
+        let by_entries = RuntimeTuning { max_resident_aot_entries: 2, ..Default::default() };
+        assert_eq!(
+            plan_aot_admission(
+                by_entries,
+                2,
+                20,
+                10,
+                now,
+                AdmitMode::Explicit,
+                vec![resident(key(1), now, 10), resident(key(2), now, 10)],
+            ),
+            AotAdmissionPlan::Admit(vec![key(1)]),
+        );
+
+        let by_bytes = RuntimeTuning { max_resident_aot_bytes: 100, ..Default::default() };
+        assert_eq!(
+            plan_aot_admission(
+                by_bytes,
+                2,
+                100,
+                70,
+                now,
+                AdmitMode::Explicit,
+                vec![resident(key(1), now, 40), resident(key(2), now, 60)],
+            ),
+            AotAdmissionPlan::Admit(vec![key(1), key(2)]),
+        );
+    }
+
+    #[test]
+    fn demand_respects_idle_age_while_explicit_bypasses_it() {
+        let last_hit_at = Instant::now();
+        let almost_idle = last_hit_at + Duration::from_secs(299);
+        let tuning = RuntimeTuning {
+            max_resident_aot_entries: 1,
+            resident_aot_min_idle: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let residents = vec![resident(key(1), last_hit_at, 10)];
+
+        assert_eq!(
+            plan_aot_admission(
+                tuning,
+                1,
+                10,
+                10,
+                almost_idle,
+                AdmitMode::Observed,
+                residents.clone(),
+            ),
+            AotAdmissionPlan::CapacityDeferred,
+        );
+        assert_eq!(
+            plan_aot_admission(tuning, 1, 10, 10, almost_idle, AdmitMode::Explicit, residents,),
+            AotAdmissionPlan::Admit(vec![key(1)]),
+        );
+    }
+
+    #[test]
+    fn oversized_candidate_is_rejected_without_victims() {
+        let tuning = RuntimeTuning { max_resident_aot_bytes: 100, ..Default::default() };
+        assert_eq!(
+            plan_aot_admission(tuning, 0, 0, 101, Instant::now(), AdmitMode::Explicit, Vec::new(),),
+            AotAdmissionPlan::Oversized,
+        );
+    }
+
+    #[test]
+    fn rate_limiter_allows_one_per_interval_without_burst() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut limiter = AotLoadLimiter::default();
+
+        assert!(limiter.try_acquire(start, interval));
+        assert!(!limiter.try_acquire(start + Duration::from_millis(99), interval));
+        assert!(limiter.try_acquire(start + interval, interval));
+
+        let after_idle = start + Duration::from_secs(10);
+        assert!(limiter.try_acquire(after_idle, interval));
+        assert!(!limiter.try_acquire(after_idle, interval));
     }
 }
