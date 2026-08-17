@@ -3,7 +3,10 @@
 use super::*;
 use alloy_primitives::{B256, Bytes};
 use revm_primitives::hardfork::SpecId;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 // ---------------------------------------------------------------------------
 // Test bytecodes.
@@ -165,6 +168,72 @@ impl ArtifactStore for EmptyStore {
 
     fn clear(&self) -> eyre::Result<()> {
         Ok(())
+    }
+}
+
+/// An empty store that counts single-artifact probes.
+#[derive(Default)]
+struct CountingEmptyStore {
+    probes: AtomicU64,
+}
+
+impl ArtifactStore for CountingEmptyStore {
+    fn load_all(&self) -> eyre::Result<Vec<(ArtifactKey, StoredArtifact)>> {
+        Ok(Vec::new())
+    }
+
+    fn load(&self, _key: &ArtifactKey) -> eyre::Result<Option<StoredArtifact>> {
+        self.probes.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn store(
+        &self,
+        _key: &ArtifactKey,
+        _manifest: &ArtifactManifest,
+        _dylib_bytes: &[u8],
+    ) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    fn delete(&self, _key: &ArtifactKey) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    fn clear(&self) -> eyre::Result<()> {
+        Ok(())
+    }
+}
+
+/// Delegates point loads to an in-memory store while suppressing eager preload.
+struct NoPreloadStore {
+    inner: Arc<RuntimeArtifactStore>,
+}
+
+impl ArtifactStore for NoPreloadStore {
+    fn load_all(&self) -> eyre::Result<Vec<(ArtifactKey, StoredArtifact)>> {
+        Ok(Vec::new())
+    }
+
+    fn load(&self, key: &ArtifactKey) -> eyre::Result<Option<StoredArtifact>> {
+        self.inner.load(key)
+    }
+
+    fn store(
+        &self,
+        key: &ArtifactKey,
+        manifest: &ArtifactManifest,
+        dylib_bytes: &[u8],
+    ) -> eyre::Result<()> {
+        self.inner.store(key, manifest, dylib_bytes)
+    }
+
+    fn delete(&self, key: &ArtifactKey) -> eyre::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn clear(&self) -> eyre::Result<()> {
+        self.inner.clear()
     }
 }
 
@@ -502,6 +571,18 @@ fn default_jit_max_bytecode_len_matches_eth_limit() {
 }
 
 #[test]
+fn default_persisted_aot_tuning_preserves_legacy_behavior() {
+    let tuning = RuntimeTuning::default();
+
+    assert_eq!(tuning.max_observed_entries, tuning.jit_max_pending_jobs * 10);
+    assert_eq!(tuning.max_resident_aot_entries, 0);
+    assert_eq!(tuning.max_resident_aot_bytes, 0);
+    assert_eq!(tuning.persisted_aot_hot_threshold, 1);
+    assert!(tuning.persisted_aot_load_interval.is_zero());
+    assert!(tuning.resident_aot_min_idle.is_zero());
+}
+
+#[test]
 #[cfg(feature = "llvm")]
 fn jit_hotness_promotion() {
     let tb =
@@ -784,6 +865,25 @@ fn concurrent_lookup_same_key() {
 
 #[test]
 #[cfg(feature = "llvm")]
+fn locked_resident_lookup_has_dedicated_counter() {
+    let tb =
+        TestBackend::with_tuning_1w(RuntimeTuning { jit_hot_threshold: 1, ..Default::default() });
+    tb.trigger_jit_cancun(BYTECODE_RET42);
+    let req = TestBackend::req_cancun(BYTECODE_RET42);
+    let before = tb.stats();
+
+    let guard = tb.backend.inner.shared.resident.get_mut(&req.key).unwrap();
+    let decision = tb.lookup(req);
+    drop(guard);
+
+    assert!(matches!(decision, LookupDecision::Interpret(InterpretReason::NotReady)));
+    let after = tb.stats();
+    assert_eq!(after.resident_lookup_locked - before.resident_lookup_locked, 1);
+    assert_eq!(after.lookup_misses - before.lookup_misses, 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
 fn single_jit_admission_per_key() {
     let compiled_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let compiled_count2 = compiled_count.clone();
@@ -937,6 +1037,72 @@ fn on_compilation_callback() {
 // ===========================================================================
 
 #[test]
+fn persisted_aot_probe_waits_for_threshold_and_caches_miss() {
+    let store = Arc::new(CountingEmptyStore::default());
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(store.clone()),
+        tuning: RuntimeTuning {
+            persisted_aot_hot_threshold: 8,
+            jit_hot_threshold: usize::MAX,
+            jit_worker_count: 0,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    for _ in 0..7 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    }
+    tb.wait_stats(|stats| stats.tracked_entries == 1);
+    assert_eq!(store.probes.load(Ordering::Relaxed), 0);
+    assert_eq!(tb.stats().persisted_aot_probes, 0);
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    tb.wait_stats(|stats| stats.persisted_aot_probes == 1);
+    for _ in 0..16 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    }
+    tb.wait_stats(|stats| stats.lookup_misses == 24 && stats.cold_entries == 1);
+
+    let stats = tb.stats();
+    assert_eq!(store.probes.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.persisted_aot_probes, 1);
+    assert_eq!(stats.persisted_aot_probe_misses, 1);
+}
+
+#[test]
+fn saturated_observation_table_interprets_without_probing() {
+    let store = Arc::new(CountingEmptyStore::default());
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(store.clone()),
+        tuning: RuntimeTuning {
+            max_observed_entries: 1,
+            persisted_aot_hot_threshold: 8,
+            jit_hot_threshold: usize::MAX,
+            jit_worker_count: 0,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    for _ in 0..16 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
+    }
+
+    let stats = tb.wait_stats(|stats| stats.observed_entry_rejections >= 16);
+    assert_eq!(stats.tracked_entries, 1);
+    assert_eq!(stats.persisted_aot_probes, 0);
+    assert_eq!(store.probes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 #[cfg(feature = "llvm")]
 fn prepare_aot_persist_and_load() {
     let store = Arc::new(RuntimeArtifactStore::new().unwrap());
@@ -983,6 +1149,345 @@ fn aot_mode_promotes_misses_to_aot() {
     let p = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
     assert_eq!(p.kind, ProgramKind::Aot);
     assert_eq!(store.len(), 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn rate_limited_positive_artifact_reuses_cached_metadata() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    {
+        let compiler = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            store: Some(store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        for bytecode in [BYTECODE_RET42, BYTECODE_ADD] {
+            compiler.prepare_aot(AotRequest {
+                code_hash: alloy_primitives::keccak256(bytecode),
+                code: Bytes::copy_from_slice(bytecode),
+                spec_id: SpecId::CANCUN,
+            });
+            compiler.wait_compiled(bytecode, SpecId::CANCUN);
+        }
+    }
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(Arc::new(NoPreloadStore { inner: store })),
+        tuning: RuntimeTuning {
+            persisted_aot_hot_threshold: 1,
+            persisted_aot_load_interval: std::time::Duration::from_secs(3600),
+            jit_hot_threshold: usize::MAX,
+            jit_worker_count: 0,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
+    let first = tb.wait_stats(|stats| {
+        stats.persisted_aot_probes == 2
+            && stats.persisted_aot_loads == 1
+            && stats.persisted_aot_rate_limited >= 1
+    });
+    assert_eq!(first.resident_aot_entries, 1);
+
+    for _ in 0..8 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
+    }
+    let retried =
+        tb.wait_stats(|stats| stats.persisted_aot_rate_limited > first.persisted_aot_rate_limited);
+    assert_eq!(retried.persisted_aot_probes, 2);
+    assert_eq!(retried.persisted_aot_loads, 1);
+
+    tb.prepare_aot(AotRequest {
+        code_hash: alloy_primitives::keccak256(BYTECODE_ADD),
+        code: Bytes::copy_from_slice(BYTECODE_ADD),
+        spec_id: SpecId::CANCUN,
+    });
+    tb.wait_compiled(BYTECODE_ADD, SpecId::CANCUN);
+    let explicit = tb.stats();
+    assert_eq!(explicit.resident_aot_entries, 2);
+    assert_eq!(explicit.persisted_aot_probes, 2);
+    assert_eq!(explicit.persisted_aot_loads, 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn preloaded_aot_seeds_exact_entry_and_byte_gauges() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let keys = [BYTECODE_RET42, BYTECODE_ADD].map(|bytecode| ArtifactKey {
+        runtime: RuntimeCacheKey {
+            code_hash: alloy_primitives::keccak256(bytecode),
+            spec_id: SpecId::CANCUN,
+        },
+        backend: BackendSelection::Llvm,
+        opt_level: RuntimeTuning::default().aot_opt_level,
+    });
+    {
+        let compiler = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            store: Some(store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        for bytecode in [BYTECODE_RET42, BYTECODE_ADD] {
+            compiler.prepare_aot(AotRequest {
+                code_hash: alloy_primitives::keccak256(bytecode),
+                code: Bytes::copy_from_slice(bytecode),
+                spec_id: SpecId::CANCUN,
+            });
+            compiler.wait_compiled(bytecode, SpecId::CANCUN);
+        }
+    }
+    let expected_bytes = keys
+        .iter()
+        .map(|key| store.load(key).unwrap().unwrap().manifest.artifact_len as u64)
+        .sum::<u64>();
+
+    let tb =
+        TestBackend::new(RuntimeConfig { enabled: true, store: Some(store), ..Default::default() });
+    let stats = tb.stats();
+    assert_eq!(stats.resident_aot_entries, 2);
+    assert_eq!(stats.resident_aot_artifact_bytes, expected_bytes);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn eager_preload_obeys_hard_aot_entry_budget() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    {
+        let compiler = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            store: Some(store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        for bytecode in [BYTECODE_RET42, BYTECODE_ADD] {
+            compiler.prepare_aot(AotRequest {
+                code_hash: alloy_primitives::keccak256(bytecode),
+                code: Bytes::copy_from_slice(bytecode),
+                spec_id: SpecId::CANCUN,
+            });
+            compiler.wait_compiled(bytecode, SpecId::CANCUN);
+        }
+    }
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        store: Some(store),
+        tuning: RuntimeTuning { max_resident_aot_entries: 1, ..Default::default() },
+        ..Default::default()
+    });
+    let stats = tb.stats();
+    assert_eq!(stats.resident_entries, 1);
+    assert_eq!(stats.resident_aot_entries, 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn explicit_aot_eviction_keeps_disk_artifact_and_active_clone() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    {
+        let compiler = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            store: Some(store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        for bytecode in [BYTECODE_RET42, BYTECODE_ADD] {
+            compiler.prepare_aot(AotRequest {
+                code_hash: alloy_primitives::keccak256(bytecode),
+                code: Bytes::copy_from_slice(bytecode),
+                spec_id: SpecId::CANCUN,
+            });
+            compiler.wait_compiled(bytecode, SpecId::CANCUN);
+        }
+    }
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        store: Some(Arc::new(NoPreloadStore { inner: store.clone() })),
+        tuning: RuntimeTuning { max_resident_aot_entries: 1, ..Default::default() },
+        ..Default::default()
+    });
+    let first_hash = alloy_primitives::keccak256(BYTECODE_RET42);
+    tb.prepare_aot(AotRequest {
+        code_hash: first_hash,
+        code: Bytes::copy_from_slice(BYTECODE_RET42),
+        spec_id: SpecId::CANCUN,
+    });
+    let active = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+
+    let second_hash = alloy_primitives::keccak256(BYTECODE_ADD);
+    tb.prepare_aot(AotRequest {
+        code_hash: second_hash,
+        code: Bytes::copy_from_slice(BYTECODE_ADD),
+        spec_id: SpecId::CANCUN,
+    });
+    tb.wait_compiled(BYTECODE_ADD, SpecId::CANCUN);
+
+    assert!(tb.get_compiled(first_hash, SpecId::CANCUN).is_none());
+    assert_eq!(active.key.code_hash, first_hash);
+    assert_ne!(active.func.into_inner() as usize, 0);
+    assert_eq!(store.len(), 2, "resident eviction must not delete persisted artifacts");
+    let stats = tb.stats();
+    assert_eq!(stats.resident_aot_entries, 1);
+    assert_eq!(stats.aot_evictions, 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn oversized_artifact_is_not_reprobed_or_loaded() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let artifact_key = ArtifactKey {
+        runtime: RuntimeCacheKey {
+            code_hash: alloy_primitives::keccak256(BYTECODE_RET42),
+            spec_id: SpecId::CANCUN,
+        },
+        backend: BackendSelection::Llvm,
+        opt_level: RuntimeTuning::default().aot_opt_level,
+    };
+    {
+        let compiler = TestBackend::new(RuntimeConfig {
+            enabled: true,
+            store: Some(store.clone()),
+            tuning: RuntimeTuning { jit_worker_count: 1, ..Default::default() },
+            ..Default::default()
+        });
+        compiler.prepare_aot(AotRequest {
+            code_hash: artifact_key.runtime.code_hash,
+            code: Bytes::copy_from_slice(BYTECODE_RET42),
+            spec_id: SpecId::CANCUN,
+        });
+        compiler.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+    }
+    let artifact_len = store.load(&artifact_key).unwrap().unwrap().manifest.artifact_len;
+    assert!(artifact_len > 0);
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(Arc::new(NoPreloadStore { inner: store })),
+        tuning: RuntimeTuning {
+            max_resident_aot_bytes: artifact_len - 1,
+            persisted_aot_hot_threshold: 1,
+            jit_hot_threshold: usize::MAX,
+            jit_worker_count: 0,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..8 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    }
+    let stats = tb.wait_stats(|stats| stats.persisted_aot_oversized == 1);
+    assert_eq!(stats.persisted_aot_probes, 1);
+    assert_eq!(stats.persisted_aot_loads, 0);
+    assert_eq!(stats.resident_aot_entries, 0);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn compiled_aot_candidate_retries_after_capacity_deferral() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(store.clone()),
+        tuning: RuntimeTuning {
+            max_resident_aot_entries: 1,
+            resident_aot_min_idle: std::time::Duration::from_secs(3600),
+            persisted_aot_hot_threshold: 1,
+            jit_hot_threshold: 1,
+            jit_worker_count: 1,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let first_hash = alloy_primitives::keccak256(BYTECODE_RET42);
+    tb.prepare_aot(AotRequest {
+        code_hash: first_hash,
+        code: Bytes::copy_from_slice(BYTECODE_RET42),
+        spec_id: SpecId::CANCUN,
+    });
+    tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+
+    let second_hash = alloy_primitives::keccak256(BYTECODE_ADD);
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
+    let deferred = tb.wait_stats(|stats| {
+        stats.compilations_succeeded == 2 && stats.persisted_aot_capacity_deferred >= 1
+    });
+    assert_eq!(deferred.resident_aot_entries, 1);
+    assert!(tb.get_compiled(first_hash, SpecId::CANCUN).is_some());
+    assert!(tb.get_compiled(second_hash, SpecId::CANCUN).is_none());
+    assert_eq!(store.len(), 2);
+    let dispatched = deferred.compilations_dispatched;
+
+    // Explicit preparation reuses the ready metadata, bypasses the idle age,
+    // and does not compile or probe again.
+    tb.prepare_aot(AotRequest {
+        code_hash: second_hash,
+        code: Bytes::copy_from_slice(BYTECODE_ADD),
+        spec_id: SpecId::CANCUN,
+    });
+    tb.wait_compiled(BYTECODE_ADD, SpecId::CANCUN);
+    let stats = tb.stats();
+    assert_eq!(stats.compilations_dispatched, dispatched);
+    assert_eq!(stats.resident_aot_entries, 1);
+    assert_eq!(stats.aot_evictions, 1);
+}
+
+#[test]
+#[cfg(feature = "llvm")]
+fn dlopen_failure_recompiles_without_reprobing() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let code_hash = alloy_primitives::keccak256(BYTECODE_RET42);
+    let artifact_key = ArtifactKey {
+        runtime: RuntimeCacheKey { code_hash, spec_id: SpecId::CANCUN },
+        backend: BackendSelection::Llvm,
+        opt_level: RuntimeTuning::default().aot_opt_level,
+    };
+    let corrupt = b"not a shared library";
+    let manifest = ArtifactManifest {
+        artifact_key: artifact_key.clone(),
+        symbol_name: "aot_corrupt".to_string(),
+        bytecode_len: BYTECODE_RET42.len(),
+        artifact_len: corrupt.len(),
+        created_at_unix_secs: 0,
+        content_hash: alloy_primitives::keccak256(corrupt).0,
+    };
+    store.store(&artifact_key, &manifest, corrupt).unwrap();
+
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        aot: true,
+        store: Some(Arc::new(NoPreloadStore { inner: store.clone() })),
+        tuning: RuntimeTuning {
+            persisted_aot_hot_threshold: 1,
+            jit_hot_threshold: 1,
+            jit_worker_count: 1,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    let program = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+    assert_eq!(program.kind, ProgramKind::Aot);
+    let stats = tb.stats();
+    assert_eq!(stats.persisted_aot_probes, 1);
+    assert_eq!(stats.compilations_dispatched, 1);
+    assert_eq!(stats.compilations_succeeded, 1);
+    assert!(store.load(&artifact_key).unwrap().unwrap().manifest.artifact_len > corrupt.len());
 }
 
 #[test]
@@ -1238,6 +1743,7 @@ fn cold_entries_are_evicted() {
     let tb = TestBackend::with_tuning_1w(RuntimeTuning {
         jit_hot_threshold: 2,
         jit_max_pending_jobs: 1,
+        max_observed_entries: 10,
         idle_evict_duration: None,
         cold_entry_idle_duration: Some(std::time::Duration::from_millis(20)),
         eviction_sweep_interval: std::time::Duration::from_millis(10),
@@ -1291,6 +1797,7 @@ fn cold_entry_eviction_preserves_resident_programs() {
 fn observed_entry_capacity_is_reported() {
     let tb = TestBackend::with_tuning(RuntimeTuning {
         jit_hot_threshold: usize::MAX,
+        max_observed_entries: 10,
         jit_max_pending_jobs: 1,
         jit_worker_count: 0,
         idle_evict_duration: None,
@@ -1312,13 +1819,15 @@ fn observed_entry_capacity_is_reported() {
 
 #[test]
 #[cfg(feature = "llvm")]
-fn persisted_aot_bypasses_saturated_observed_entry_capacity() {
+fn persisted_aot_respects_saturated_observed_entry_capacity() {
     let store = Arc::new(RuntimeArtifactStore::new().unwrap());
     let code_hash = alloy_primitives::keccak256(BYTECODE_RET42);
     let tb = TestBackend::new(RuntimeConfig {
         enabled: true,
         store: Some(store.clone()),
         tuning: RuntimeTuning {
+            max_observed_entries: 10,
+            persisted_aot_hot_threshold: 1,
             jit_hot_threshold: usize::MAX,
             jit_max_pending_jobs: 1,
             jit_worker_count: 1,
@@ -1346,16 +1855,18 @@ fn persisted_aot_bypasses_saturated_observed_entry_capacity() {
         let _ = tb.lookup(TestBackend::req_cancun(&indexed_bytecode(i)));
     }
     tb.wait_stats(|stats| stats.tracked_entries == 10);
+    let probes_after_fill = tb.stats().persisted_aot_probes;
 
     let first = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
     assert!(matches!(first, LookupDecision::Interpret(_)));
-    let compiled = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
-    assert_eq!(compiled.kind, ProgramKind::Aot);
+    tb.wait_stats(|stats| stats.observed_entry_rejections >= 1);
 
     let stats = tb.stats();
     assert_eq!(stats.tracked_entries, 10);
-    assert_eq!(stats.observed_entry_rejections, 0);
+    assert!(stats.observed_entry_rejections >= 1);
+    assert_eq!(stats.persisted_aot_probes, probes_after_fill);
     assert_eq!(stats.compilations_dispatched, dispatched_before);
+    assert!(tb.get_compiled(code_hash, SpecId::CANCUN).is_none());
 }
 
 // ===========================================================================

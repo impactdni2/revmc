@@ -268,6 +268,16 @@ pub struct RuntimeTuning {
     /// Defaults to `1`.
     pub lookup_hit_sample_rate: usize,
 
+    /// Maximum number of keys retained for observed-miss tracking.
+    ///
+    /// New keys are interpreted without probing persisted storage once this
+    /// bound is reached. `0` disables observed-miss tracking and demand
+    /// compilation while explicit compilation requests remain available.
+    ///
+    /// Defaults to `20480`, matching the previous implicit
+    /// `jit_max_pending_jobs * 10` bound.
+    pub max_observed_entries: usize,
+
     /// Maximum delay between lookup observation and hotness accounting.
     ///
     /// Defaults to `100ms`.
@@ -338,6 +348,44 @@ pub struct RuntimeTuning {
     /// Defaults to [`OptimizationLevel::Default`](crate::OptimizationLevel::Default).
     pub aot_opt_level: crate::OptimizationLevel,
 
+    /// Maximum number of resident AOT programs. `0` = no limit.
+    ///
+    /// This budget is independent from [`Self::resident_code_cache_bytes`],
+    /// which accounts for JIT allocations.
+    ///
+    /// Defaults to `0`.
+    pub max_resident_aot_entries: usize,
+
+    /// Maximum aggregate persisted-artifact file bytes represented by
+    /// resident AOT programs. `0` = no limit.
+    ///
+    /// Artifact-file length is a stable budget proxy, not an exact measure of
+    /// process RSS after `dlopen`.
+    ///
+    /// Defaults to `0`.
+    pub max_resident_aot_bytes: usize,
+
+    /// Number of observed misses before persisted AOT storage is probed.
+    ///
+    /// Defaults to `1`, preserving first-miss loading for consumers that do
+    /// not opt into delayed demand loading.
+    pub persisted_aot_hot_threshold: usize,
+
+    /// Minimum interval between demand-loaded persisted AOT programs.
+    ///
+    /// The limiter has no burst capacity. `Duration::ZERO` disables rate
+    /// limiting.
+    ///
+    /// Defaults to `Duration::ZERO`.
+    pub persisted_aot_load_interval: Duration,
+
+    /// Minimum idle time before a resident AOT program may be evicted for a
+    /// demand-loaded artifact. Explicit AOT requests bypass this delay but
+    /// still obey the hard AOT budgets.
+    ///
+    /// `Duration::ZERO` permits immediate LRU replacement and is the default.
+    pub resident_aot_min_idle: Duration,
+
     /// Maximum total resident compiled code size in bytes. `0` = no limit.
     ///
     /// When exceeded, least-recently-used entries are evicted.
@@ -394,6 +442,7 @@ impl Default for RuntimeTuning {
             channel_capacity: 4096,
             max_events_per_drain: 4096,
             lookup_hit_sample_rate: 1,
+            max_observed_entries: 20480,
             event_drain_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             jit_hot_threshold: 8,
@@ -406,6 +455,11 @@ impl Default for RuntimeTuning {
             jit_worker_queue_capacity: 64,
             jit_opt_level: crate::OptimizationLevel::default(),
             aot_opt_level: crate::OptimizationLevel::default(),
+            max_resident_aot_entries: 0,
+            max_resident_aot_bytes: 0,
+            persisted_aot_hot_threshold: 1,
+            persisted_aot_load_interval: Duration::ZERO,
+            resident_aot_min_idle: Duration::ZERO,
             resident_code_cache_bytes: 1024 * 1024 * 1024,
             idle_evict_duration: Some(Duration::from_secs(600)),
             cold_entry_idle_duration: Some(Duration::from_secs(600)),

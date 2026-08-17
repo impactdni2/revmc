@@ -13,6 +13,7 @@ use api::LoadedLibrary;
 use backend::{Command, CompileJitRequest, EventQueue, PrepareAotRequest, ResidentMap};
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
+use dashmap::try_result::TryResult;
 use revm_primitives::{B256, hardfork::SpecId, hints_util::cold_path};
 use stats::RuntimeStats;
 use std::{
@@ -229,26 +230,35 @@ impl JitBackend {
             return LookupDecision::Interpret(InterpretReason::Ineligible);
         }
 
-        if let Some(program_ref) = shared.resident.try_get(&req.key).try_unwrap() {
-            let program = Arc::clone(&program_ref);
-            drop(program_ref);
-            let hit = shared.stats.lookup_hits.fetch_add(1, Ordering::Relaxed) + 1;
-            let sample_rate = inner.tuning.lookup_hit_sample_rate;
-            if sample_rate != 0 && hit.is_multiple_of(sample_rate as u64) {
-                req.code.clear();
-                if let Err(_v) = shared.hit_events.push(req) {
+        match shared.resident.try_get(&req.key) {
+            TryResult::Present(program_ref) => {
+                let program = Arc::clone(&program_ref);
+                drop(program_ref);
+                let hit = shared.stats.lookup_hits.fetch_add(1, Ordering::Relaxed) + 1;
+                let sample_rate = inner.tuning.lookup_hit_sample_rate;
+                if sample_rate != 0 && hit.is_multiple_of(sample_rate as u64) {
+                    req.code.clear();
+                    if let Err(_v) = shared.hit_events.push(req) {
+                        cold_path();
+                        shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                LookupDecision::Compiled(program)
+            }
+            TryResult::Absent => {
+                shared.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
+                if let Err(_v) = shared.miss_events.push(req) {
                     cold_path();
                     shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                 }
+                LookupDecision::Interpret(InterpretReason::NotReady)
             }
-            LookupDecision::Compiled(program)
-        } else {
-            shared.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
-            if let Err(_v) = shared.miss_events.push(req) {
+            TryResult::Locked => {
                 cold_path();
-                shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                shared.stats.lookup_misses.fetch_add(1, Ordering::Relaxed);
+                shared.stats.resident_lookup_locked.fetch_add(1, Ordering::Relaxed);
+                LookupDecision::Interpret(InterpretReason::NotReady)
             }
-            LookupDecision::Interpret(InterpretReason::NotReady)
         }
     }
 
@@ -470,7 +480,7 @@ impl JitBackend {
         );
 
         // Preload AOT artifacts into the already-allocated resident map.
-        match Self::preload_aot(config.store.as_deref()) {
+        match Self::preload_aot(config.store.as_deref(), config.tuning) {
             Ok(entries) => {
                 for (key, prog) in entries {
                     self.inner.shared.resident.insert(key, prog);
@@ -504,6 +514,7 @@ impl JitBackend {
     /// Preloads AOT artifacts from the store as `Arc<CompiledProgram>`s ready to insert.
     fn preload_aot(
         store: Option<&dyn ArtifactStore>,
+        tuning: RuntimeTuning,
     ) -> eyre::Result<Vec<(RuntimeCacheKey, Arc<CompiledProgram>)>> {
         let Some(store) = store else {
             debug!("no artifact store configured, skipping AOT preload");
@@ -521,19 +532,33 @@ impl JitBackend {
         let mut seen = alloy_primitives::map::HashSet::<RuntimeCacheKey>::default();
         let mut loaded = 0u64;
         let mut failed = 0u64;
+        let mut capacity_skipped = 0u64;
+        let mut resident_aot_bytes = 0usize;
 
         for (artifact_key, stored) in artifacts {
+            let key = artifact_key.runtime;
+            if seen.contains(&key) {
+                warn!(
+                    code_hash = %key.code_hash,
+                    spec_id = ?key.spec_id,
+                    "duplicate artifact key, keeping first",
+                );
+                continue;
+            }
+            let entry_limit_reached =
+                tuning.max_resident_aot_entries > 0 && out.len() >= tuning.max_resident_aot_entries;
+            let byte_limit_reached = tuning.max_resident_aot_bytes > 0
+                && resident_aot_bytes.saturating_add(stored.manifest.artifact_len)
+                    > tuning.max_resident_aot_bytes;
+            if entry_limit_reached || byte_limit_reached {
+                capacity_skipped += 1;
+                continue;
+            }
             match Self::load_artifact(&artifact_key, &stored) {
                 Ok(program) => {
-                    let key = artifact_key.runtime;
-                    if !seen.insert(key) {
-                        warn!(
-                            code_hash = %key.code_hash,
-                            spec_id = ?key.spec_id,
-                            "duplicate artifact key, keeping first",
-                        );
-                        continue;
-                    }
+                    seen.insert(key);
+                    resident_aot_bytes =
+                        resident_aot_bytes.saturating_add(stored.manifest.artifact_len);
                     out.push((key, Arc::new(program)));
                     loaded += 1;
                 }
@@ -548,7 +573,7 @@ impl JitBackend {
             }
         }
 
-        info!(loaded, failed, "AOT preload complete");
+        info!(loaded, failed, capacity_skipped, resident_aot_bytes, "AOT preload complete");
         Ok(out)
     }
 
@@ -565,7 +590,7 @@ impl JitBackend {
         };
 
         let library = Arc::new(LoadedLibrary::new(library));
-        Ok(CompiledProgram::new_aot(key.runtime, func, library))
+        Ok(CompiledProgram::new_aot(key.runtime, func, library, stored.manifest.artifact_len))
     }
 }
 
@@ -575,8 +600,17 @@ impl BackendShared {
     /// `command_queue_len` is omitted because the command channel sender lives
     /// on [`BackendInner`], not [`BackendShared`].
     pub(crate) fn stats(&self) -> RuntimeStatsSnapshot {
+        let (resident_aot_entries, resident_aot_artifact_bytes) = self
+            .resident
+            .iter()
+            .filter(|entry| entry.kind == ProgramKind::Aot)
+            .fold((0u64, 0u64), |(entries, bytes), entry| {
+                (entries + 1, bytes.saturating_add(entry.artifact_len as u64))
+            });
         self.stats.snapshot(stats::RuntimeStatsGauges {
             resident_entries: self.resident.len() as u64,
+            resident_aot_entries,
+            resident_aot_artifact_bytes,
             events_queued: (self.miss_events.len() + self.hit_events.len()) as u64,
             command_queue_len: 0,
         })

@@ -47,6 +47,8 @@ pub struct CompiledProgram {
     pub key: RuntimeCacheKey,
     /// Whether this is an AOT or JIT program.
     pub kind: ProgramKind,
+    /// Persisted artifact-file length for AOT programs. JIT programs use zero.
+    pub(crate) artifact_len: usize,
     /// Keeps the backing memory (shared library / JIT module) alive.
     _backing: ProgramBacking,
 }
@@ -67,8 +69,15 @@ impl CompiledProgram {
         key: RuntimeCacheKey,
         func: EvmCompilerFn,
         library: Arc<LoadedLibrary>,
+        artifact_len: usize,
     ) -> Self {
-        Self { key, kind: ProgramKind::Aot, func, _backing: ProgramBacking::LoadedLibrary(library) }
+        Self {
+            key,
+            kind: ProgramKind::Aot,
+            func,
+            artifact_len,
+            _backing: ProgramBacking::LoadedLibrary(library),
+        }
     }
 
     /// Creates a new compiled program backed by a JIT module's
@@ -78,7 +87,13 @@ impl CompiledProgram {
         func: EvmCompilerFn,
         backing: Arc<JitCodeBacking>,
     ) -> Self {
-        Self { key, kind: ProgramKind::Jit, func, _backing: ProgramBacking::JitModule(backing) }
+        Self {
+            key,
+            kind: ProgramKind::Jit,
+            func,
+            artifact_len: 0,
+            _backing: ProgramBacking::JitModule(backing),
+        }
     }
 }
 
