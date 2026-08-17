@@ -1310,6 +1310,54 @@ fn observed_entry_capacity_is_reported() {
     assert_eq!(stats.observed_entry_rejections, 1);
 }
 
+#[test]
+#[cfg(feature = "llvm")]
+fn persisted_aot_bypasses_saturated_observed_entry_capacity() {
+    let store = Arc::new(RuntimeArtifactStore::new().unwrap());
+    let code_hash = alloy_primitives::keccak256(BYTECODE_RET42);
+    let tb = TestBackend::new(RuntimeConfig {
+        enabled: true,
+        store: Some(store.clone()),
+        tuning: RuntimeTuning {
+            jit_hot_threshold: usize::MAX,
+            jit_max_pending_jobs: 1,
+            jit_worker_count: 1,
+            idle_evict_duration: None,
+            cold_entry_idle_duration: None,
+            event_drain_interval: std::time::Duration::from_millis(1),
+            ..Default::default()
+        },
+        aot: true,
+        ..Default::default()
+    });
+
+    tb.prepare_aot(AotRequest {
+        code_hash,
+        code: Bytes::copy_from_slice(BYTECODE_RET42),
+        spec_id: SpecId::CANCUN,
+    });
+    tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+    assert_eq!(store.len(), 1);
+    let dispatched_before = tb.stats().compilations_dispatched;
+
+    tb.clear_resident();
+    tb.wait_resident_count(0);
+    for i in 0..10 {
+        let _ = tb.lookup(TestBackend::req_cancun(&indexed_bytecode(i)));
+    }
+    tb.wait_stats(|stats| stats.tracked_entries == 10);
+
+    let first = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    assert!(matches!(first, LookupDecision::Interpret(_)));
+    let compiled = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+    assert_eq!(compiled.kind, ProgramKind::Aot);
+
+    let stats = tb.stats();
+    assert_eq!(stats.tracked_entries, 10);
+    assert_eq!(stats.observed_entry_rejections, 0);
+    assert_eq!(stats.compilations_dispatched, dispatched_before);
+}
+
 // ===========================================================================
 // Tests: compiler recycling.
 // ===========================================================================
