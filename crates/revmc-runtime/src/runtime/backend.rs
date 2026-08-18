@@ -601,7 +601,7 @@ impl BackendState {
                 self.inner.stats.compilations_dispatched.fetch_add(1, Ordering::Relaxed);
             }
             Err(job) => {
-                warn!(code_hash = %key.code_hash, "worker pool saturated, dropping request");
+                debug!(code_hash = %key.code_hash, "worker pool saturated, dropping request");
                 job.sync_notifier.notify();
             }
         }
