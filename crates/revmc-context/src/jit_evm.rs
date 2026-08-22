@@ -5,7 +5,8 @@
 //! falling back to the interpreter for unknown contracts.
 
 use revm_context_interface::{
-    ContextSetters, ContextTr,
+    ContextSetters, ContextTr, Host,
+    cfg::GasParams,
     journaled_state::JournalTr,
     result::{EVMError, HaltReason, InvalidTransaction, ResultAndState},
 };
@@ -34,28 +35,46 @@ pub struct JitEvm<EVM, F = fn(B256, &[u8]) -> Option<EvmCompilerFn>> {
     inner: EVM,
     functions: B256Map<RawEvmCompilerFn>,
     on_miss: F,
+    gas_params: GasParams,
 }
 
 fn no_miss(_: B256, _: &[u8]) -> Option<EvmCompilerFn> {
     None
 }
 
-impl<EVM> JitEvm<EVM> {
+impl<EVM> JitEvm<EVM>
+where
+    EVM: EvmTr,
+    EVM::Context: Host,
+{
     /// Create a new JIT EVM wrapper that falls back to the interpreter on miss.
     pub fn new(inner: EVM, functions: B256Map<RawEvmCompilerFn>) -> Self {
-        Self { inner, functions, on_miss: no_miss }
+        let gas_params = inner.ctx_ref().gas_params().clone();
+        Self { inner, functions, on_miss: no_miss, gas_params }
     }
 }
 
-impl<EVM, F> JitEvm<EVM, F> {
+impl<EVM, F> JitEvm<EVM, F>
+where
+    EVM: EvmTr,
+    EVM::Context: Host,
+{
     /// Create a new JIT EVM wrapper with a custom miss handler.
     pub fn with_on_miss(inner: EVM, functions: B256Map<RawEvmCompilerFn>, on_miss: F) -> Self {
-        Self { inner, functions, on_miss }
+        let gas_params = inner.ctx_ref().gas_params().clone();
+        Self { inner, functions, on_miss, gas_params }
     }
 
     /// Consumes the wrapper and returns the inner EVM.
     pub fn into_inner(self) -> EVM {
         self.inner
+    }
+
+    fn refresh_gas_params(&mut self) {
+        let host_gas_params = self.inner.ctx_ref().gas_params();
+        if !core::ptr::eq(self.gas_params.table(), host_gas_params.table()) {
+            self.gas_params = host_gas_params.clone();
+        }
     }
 }
 
@@ -131,9 +150,11 @@ where
         };
 
         if let Some(f) = f {
+            let gas_params = &self.gas_params;
             let (ctx, _, _, frame_stack) = self.inner.all_mut();
             let frame = frame_stack.get();
-            let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
+            let action =
+                unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx, gas_params) };
             Ok(frame.process_next_action::<_, ContextDbError<Self::Context>>(ctx, action).inspect(
                 |i| {
                     if i.is_result() {
@@ -174,6 +195,7 @@ where
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.ctx_mut().set_tx(tx);
+        self.refresh_gas_params();
         MainnetHandler::default().run(self)
     }
 
@@ -186,6 +208,7 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState<HaltReason>, Self::Error> {
+        self.refresh_gas_params();
         MainnetHandler::default().run(self).map(|result| {
             let state = self.ctx_mut().journal_mut().finalize();
             ResultAndState::new(result, state)
@@ -260,10 +283,11 @@ where
             (*inspector_ptr).log(&mut *ctx_ptr, log.clone());
         };
 
+        let gas_params = &self.gas_params;
         let (ctx, _, _, frame_stack) = self.inner.all_mut();
         let frame = frame_stack.get();
         let action = unsafe {
-            f.call_with_interpreter_with(&mut frame.interpreter, ctx, |ecx| {
+            f.call_with_interpreter_with(&mut frame.interpreter, ctx, gas_params, |ecx| {
                 // SAFETY: `on_log` lives on the stack and outlives the JIT call.
                 // The closure captures raw pointers whose types may not be
                 // `'static`, so we erase the lifetime via pointer cast.
@@ -316,6 +340,7 @@ where
     #[inline]
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.ctx_mut().set_tx(tx);
+        self.refresh_gas_params();
         MainnetHandler::default().inspect_run(self)
     }
 }

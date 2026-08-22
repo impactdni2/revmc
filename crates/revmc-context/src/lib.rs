@@ -117,8 +117,8 @@ pub struct EvmContext<'a> {
     pub exit_result: InstructionResult,
     /// Saved RSP from the entry trampoline, used by [`revmc_exit`] to unwind.
     pub exit_sp: *mut u8,
-    /// Cached gas parameters from the host.
-    pub gas_params: GasParams,
+    /// Cached gas parameters borrowed from the owning EVM.
+    pub gas_params: &'a GasParams,
     /// Cached base pointer for the current memory context.
     /// Points to `memory[checkpoint..]`, i.e. the start of the current context's memory.
     /// Refreshed after any memory resize.
@@ -139,6 +139,9 @@ const _: () = {
     assert!(offset_of!(EvmContext<'_>, spec_id) == 121);
     assert!(offset_of!(EvmContext<'_>, resume_at) == 128);
     assert!(offset_of!(EvmContext<'_>, calldatasize) == 168);
+    assert!(offset_of!(EvmContext<'_>, gas_params) == 192);
+    assert!(offset_of!(EvmContext<'_>, mem_base) == 200);
+    assert!(offset_of!(EvmContext<'_>, mem_len) == 208);
 };
 
 impl fmt::Debug for EvmContext<'_> {
@@ -150,8 +153,12 @@ impl fmt::Debug for EvmContext<'_> {
 impl<'a> EvmContext<'a> {
     /// Creates a new context from an interpreter.
     #[inline]
-    pub fn from_interpreter(interpreter: &'a mut Interpreter, host: &'a mut dyn Host) -> Self {
-        Self::from_interpreter_with_stack(interpreter, host).0
+    pub fn from_interpreter(
+        interpreter: &'a mut Interpreter,
+        host: &'a mut dyn Host,
+        gas_params: &'a GasParams,
+    ) -> Self {
+        Self::from_interpreter_with_stack(interpreter, host, gas_params).0
     }
 
     /// Creates a new context from an interpreter.
@@ -159,12 +166,12 @@ impl<'a> EvmContext<'a> {
     pub fn from_interpreter_with_stack<'b: 'a>(
         interpreter: &'a mut Interpreter,
         host: &'b mut dyn Host,
+        gas_params: &'a GasParams,
     ) -> (Self, &'a mut EvmStack, &'a mut usize) {
         let resume_at = ResumeAt::load(interpreter);
         let (stack, stack_len) = EvmStack::from_interpreter_stack(&mut interpreter.stack);
         let bytecode = interpreter.bytecode.bytecode_slice() as *const [u8];
         let calldatasize = interpreter.input.input.len();
-        let gas_params = host.gas_params().clone();
         let mut this = Self {
             memory: &mut interpreter.memory,
             input: &mut interpreter.input,
@@ -284,8 +291,9 @@ impl EvmCompilerFn {
         self,
         interpreter: &mut Interpreter,
         host: &mut dyn Host,
+        gas_params: &GasParams,
     ) -> InterpreterAction {
-        self.call_with_interpreter_inner(interpreter, host, |_| {})
+        self.call_with_interpreter_inner(interpreter, host, gas_params, |_| {})
     }
 
     /// Like [`call_with_interpreter`](Self::call_with_interpreter), but calls `configure` on the
@@ -302,21 +310,23 @@ impl EvmCompilerFn {
         self,
         interpreter: &mut Interpreter,
         host: &mut dyn Host,
+        gas_params: &GasParams,
         configure: impl FnOnce(&mut EvmContext<'_>),
     ) -> InterpreterAction {
-        self.call_with_interpreter_inner(interpreter, host, configure)
+        self.call_with_interpreter_inner(interpreter, host, gas_params, configure)
     }
 
     unsafe fn call_with_interpreter_inner(
         self,
         interpreter: &mut Interpreter,
         host: &mut dyn Host,
+        gas_params: &GasParams,
         configure: impl FnOnce(&mut EvmContext<'_>),
     ) -> InterpreterAction {
         interpreter.bytecode.action = None;
 
         let (mut ecx, stack, stack_len) =
-            EvmContext::from_interpreter_with_stack(interpreter, host);
+            EvmContext::from_interpreter_with_stack(interpreter, host, gas_params);
         configure(&mut ecx);
         let result = self.call(stack, stack_len, &mut ecx);
 

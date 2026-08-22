@@ -6,7 +6,7 @@ use clap::Parser;
 use eyre::Context;
 use revmc::{
     EvmCompiler, SpecId,
-    context_interface::host::DummyHost,
+    context_interface::{Host, host::DummyHost},
     interpreter::{
         Interpreter,
         interpreter::{ExtBytecode, InputsImpl, SharedMemory},
@@ -48,7 +48,8 @@ fn main() -> eyre::Result<()> {
     let mut interpreter =
         Interpreter::new(memory, ext_bytecode, input, false, SpecId::CANCUN, 1_000_000);
     let mut host = DummyHost::new(SpecId::CANCUN);
-    let result = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let gas_params = host.gas_params().clone();
+    let result = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
     eprintln!("{result:#?}");
 
     Ok(())
