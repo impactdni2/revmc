@@ -86,7 +86,7 @@ pub(crate) fn ensure_memory(ecx: &mut EvmContext<'_>, offset: usize, len: usize)
     revm_interpreter::interpreter::resize_memory(
         &mut ecx.gas,
         ecx.memory,
-        ecx.gas_params,
+        &ecx.gas_params,
         offset,
         len,
     )?;
