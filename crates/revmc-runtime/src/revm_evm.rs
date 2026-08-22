@@ -106,17 +106,17 @@ where
         }
     }
 
-    fn refresh_gas_params(&mut self) {
-        let host_gas_params = self.inner.ctx_ref().gas_params();
+    #[inline]
+    fn invalidate_cache(&mut self) {
+        // Read the context once: transaction setup already checks the spec on every run, so the
+        // gas-table refresh should add only the table-pointer comparison on the unchanged path.
+        let context = self.inner.ctx_ref();
+        let host_gas_params = context.gas_params();
+        let spec_id: SpecId = context.cfg().spec().into();
         if !core::ptr::eq(self.gas_params.table(), host_gas_params.table()) {
             self.gas_params = host_gas_params.clone();
         }
-    }
 
-    fn invalidate_cache(&mut self) {
-        self.refresh_gas_params();
-
-        let spec_id: SpecId = self.inner.ctx_ref().cfg().spec().into();
         if spec_id != self.lookup_cache_spec_id {
             self.lookup_cache.clear();
             self.lookup_cache_spec_id = spec_id;
@@ -557,7 +557,7 @@ mod tests {
         updated.override_gas([(GasId::call_stipend(), 1_337)]);
         evm.inner_mut().ctx_mut().cfg.set_gas_params(updated);
 
-        evm.refresh_gas_params();
+        evm.invalidate_cache();
 
         assert_ne!(evm.gas_params.table().as_ptr(), original_table);
         assert_eq!(evm.gas_params.call_stipend(), 1_337);
