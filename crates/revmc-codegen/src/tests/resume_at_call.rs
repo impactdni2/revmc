@@ -55,6 +55,7 @@ fn run_call_then_push<B: Backend>(compiler: &mut EvmCompiler<B>) {
 
     // First call: should suspend at CALL with NewFrame
     let mut host = TestHost::new();
+    let gas_params = host.gas_params.clone();
     let input = InputsImpl {
         target_address: DEF_ADDR,
         bytecode_address: None,
@@ -68,7 +69,7 @@ fn run_call_then_push<B: Backend>(compiler: &mut EvmCompiler<B>) {
     let mut interpreter =
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, DEF_SPEC, DEF_GAS_LIMIT);
 
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
 
     // Should get NewFrame(Call(...))
     let return_memory_offset = match &action {
@@ -87,7 +88,7 @@ fn run_call_then_push<B: Backend>(compiler: &mut EvmCompiler<B>) {
     insert_call_outcome_test(&mut interpreter, call_result, return_memory_offset);
 
     // Second call: should resume after CALL, execute PUSH1 0x42, STOP
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
 
     match &action {
         InterpreterAction::Return(result) => {
@@ -139,6 +140,7 @@ fn run_call_then_return<B: Backend>(compiler: &mut EvmCompiler<B>) {
     let f = unsafe { compiler.jit("resume_return", bytecode, DEF_SPEC) }.unwrap();
 
     let mut host = TestHost::new();
+    let gas_params = host.gas_params.clone();
     let input = InputsImpl {
         target_address: DEF_ADDR,
         bytecode_address: None,
@@ -153,7 +155,7 @@ fn run_call_then_return<B: Backend>(compiler: &mut EvmCompiler<B>) {
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, DEF_SPEC, DEF_GAS_LIMIT);
 
     // First call: suspends at CALL
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
     let return_memory_offset = match &action {
         InterpreterAction::NewFrame(FrameInput::Call(call_inputs)) => {
             Some(call_inputs.return_memory_offset.clone())
@@ -170,7 +172,7 @@ fn run_call_then_return<B: Backend>(compiler: &mut EvmCompiler<B>) {
     insert_call_outcome_test(&mut interpreter, call_result, return_memory_offset);
 
     // Second call: should resume, POP, PUSH1 32, PUSH0, RETURN
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
 
     match &action {
         InterpreterAction::Return(result) => {
@@ -215,6 +217,7 @@ fn run_call_returndatasize<B: Backend>(compiler: &mut EvmCompiler<B>) {
     let f = unsafe { compiler.jit("resume_rds", bytecode, DEF_SPEC) }.unwrap();
 
     let mut host = TestHost::new();
+    let gas_params = host.gas_params.clone();
     let input = InputsImpl {
         target_address: DEF_ADDR,
         bytecode_address: None,
@@ -229,7 +232,7 @@ fn run_call_returndatasize<B: Backend>(compiler: &mut EvmCompiler<B>) {
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, DEF_SPEC, DEF_GAS_LIMIT);
 
     // First call: suspends at CALL
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
     let return_memory_offset = match &action {
         InterpreterAction::NewFrame(FrameInput::Call(call_inputs)) => {
             Some(call_inputs.return_memory_offset.clone())
@@ -247,7 +250,7 @@ fn run_call_returndatasize<B: Backend>(compiler: &mut EvmCompiler<B>) {
     insert_call_outcome_test(&mut interpreter, call_result, return_memory_offset);
 
     // Second call: resume → POP → RETURNDATASIZE → MSTORE → RETURN
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
 
     match &action {
         InterpreterAction::Return(result) => {
@@ -332,6 +335,7 @@ fn run_call_pop_push_sload_stack_len<B: Backend>(compiler: &mut EvmCompiler<B>) 
     let f = unsafe { compiler.jit("pop_push_sload", bytecode, DEF_SPEC) }.unwrap();
 
     let mut host = TestHost::new();
+    let gas_params = host.gas_params.clone();
     let input = InputsImpl {
         target_address: DEF_ADDR,
         bytecode_address: None,
@@ -346,7 +350,7 @@ fn run_call_pop_push_sload_stack_len<B: Backend>(compiler: &mut EvmCompiler<B>) 
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, DEF_SPEC, DEF_GAS_LIMIT);
 
     // First call: suspends at CALL.
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
     let return_memory_offset = match &action {
         InterpreterAction::NewFrame(FrameInput::Call(call_inputs)) => {
             Some(call_inputs.return_memory_offset.clone())
@@ -363,7 +367,7 @@ fn run_call_pop_push_sload_stack_len<B: Backend>(compiler: &mut EvmCompiler<B>) 
     insert_call_outcome_test(&mut interpreter, call_result, return_memory_offset);
 
     // Second call: resume → POP → PUSH1 → SLOAD → JUMPDEST → POP → MSTORE → RETURN.
-    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host) };
+    let action = unsafe { f.call_with_interpreter(&mut interpreter, &mut host, &gas_params) };
 
     match &action {
         InterpreterAction::Return(result) => {

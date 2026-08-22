@@ -9,6 +9,7 @@ use alloy_primitives::{Address, Bytes};
 use revm_context::{Host, JournalEntry};
 use revm_context_interface::{
     Cfg, ContextSetters, ContextTr, Database,
+    cfg::GasParams,
     journaled_state::JournalTr,
     result::{EVMError, HaltReason, InvalidTransaction, ResultAndState},
 };
@@ -38,6 +39,8 @@ use std::sync::Arc;
 pub struct JitEvm<EVM> {
     inner: EVM,
     backend: JitBackend,
+    /// Immutable gas table snapshot borrowed by each native execution context.
+    gas_params: GasParams,
     /// Cached lookup decisions keyed by `code_hash` alone.
     /// Invalidated when the `spec_id` changes.
     #[debug(skip)]
@@ -81,7 +84,7 @@ impl<EVM> JitEvm<EVM> {
 
 impl<EVM: EvmTr> JitEvm<EVM>
 where
-    EVM::Context: ContextTr,
+    EVM::Context: ContextTr + Host,
 {
     /// Creates a new JIT EVM with a disabled backend.
     ///
@@ -93,15 +96,26 @@ where
     /// Creates a new JIT EVM from an inner EVM and backend.
     pub fn new(inner: EVM, backend: JitBackend) -> Self {
         let spec_id: SpecId = inner.ctx_ref().cfg().spec().into();
+        let gas_params = inner.ctx_ref().gas_params().clone();
         Self {
             inner,
             backend,
+            gas_params,
             lookup_cache: B256Map::with_capacity_and_hasher(16, Default::default()),
             lookup_cache_spec_id: spec_id,
         }
     }
 
+    fn refresh_gas_params(&mut self) {
+        let host_gas_params = self.inner.ctx_ref().gas_params();
+        if !core::ptr::eq(self.gas_params.table(), host_gas_params.table()) {
+            self.gas_params = host_gas_params.clone();
+        }
+    }
+
     fn invalidate_cache(&mut self) {
+        self.refresh_gas_params();
+
         let spec_id: SpecId = self.inner.ctx_ref().cfg().spec().into();
         if spec_id != self.lookup_cache_spec_id {
             self.lookup_cache.clear();
@@ -190,10 +204,12 @@ where
 
         Ok(match decision {
             LookupDecision::Compiled(program) => {
+                let gas_params = &self.gas_params;
                 let (ctx, _, _, frame_stack) = self.inner.all_mut();
                 let frame = frame_stack.get();
-                let action =
-                    unsafe { program.func.call_with_interpreter(&mut frame.interpreter, ctx) };
+                let action = unsafe {
+                    program.func.call_with_interpreter(&mut frame.interpreter, ctx, gas_params)
+                };
                 frame.process_next_action::<_, ContextDbError<Self::Context>>(ctx, action).inspect(
                     |i| {
                         if i.is_result() {
@@ -380,18 +396,24 @@ where
             (*inspector_ptr).log(&mut *ctx_ptr, log.clone());
         };
 
+        let gas_params = &self.gas_params;
         let (ctx, _, _, frame_stack) = self.inner.all_mut();
         let frame = frame_stack.get();
         let action = unsafe {
-            program.func.call_with_interpreter_with(&mut frame.interpreter, ctx, |ecx| {
-                // SAFETY: `on_log` lives on the stack and outlives the JIT call.
-                // The closure captures raw pointers whose types may not be
-                // `'static`, so we erase the lifetime via pointer cast.
-                ecx.on_log = Some(core::mem::transmute::<
-                    &mut dyn FnMut(&revm_primitives::Log),
-                    &mut (dyn FnMut(&revm_primitives::Log) + '_),
-                >(&mut on_log));
-            })
+            program.func.call_with_interpreter_with(
+                &mut frame.interpreter,
+                ctx,
+                gas_params,
+                |ecx| {
+                    // SAFETY: `on_log` lives on the stack and outlives the JIT call.
+                    // The closure captures raw pointers whose types may not be
+                    // `'static`, so we erase the lifetime via pointer cast.
+                    ecx.on_log = Some(core::mem::transmute::<
+                        &mut dyn FnMut(&revm_primitives::Log),
+                        &mut (dyn FnMut(&revm_primitives::Log) + '_),
+                    >(&mut on_log));
+                },
+            )
         };
 
         // Handle selfdestruct.
@@ -498,7 +520,10 @@ mod tests {
     use alloy_primitives::{Address, Bytes, TxKind, U256};
     use revm_bytecode::opcode as op;
     use revm_context::TxEnv;
-    use revm_context_interface::result::{ExecutionResult, Output};
+    use revm_context_interface::{
+        cfg::gas_params::GasId,
+        result::{ExecutionResult, Output},
+    };
     use revm_database::{CacheDB, EmptyDB};
     use revm_handler::MainBuilder;
 
@@ -522,6 +547,20 @@ mod tests {
 
     fn test_jit_evm(backend: JitBackend) -> JitEvm<TestInnerEvm> {
         test_jit_evm_with_spec(backend, SpecId::CANCUN)
+    }
+
+    #[test]
+    fn refreshes_borrowed_gas_params_after_host_update() {
+        let mut evm = test_jit_evm(JitBackend::disabled());
+        let original_table = evm.gas_params.table().as_ptr();
+        let mut updated = GasParams::new_spec(SpecId::CANCUN);
+        updated.override_gas([(GasId::call_stipend(), 1_337)]);
+        evm.inner_mut().ctx_mut().cfg.set_gas_params(updated);
+
+        evm.refresh_gas_params();
+
+        assert_ne!(evm.gas_params.table().as_ptr(), original_table);
+        assert_eq!(evm.gas_params.call_stipend(), 1_337);
     }
 
     fn deploy_contract_with_nonce(

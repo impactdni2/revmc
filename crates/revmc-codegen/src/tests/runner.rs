@@ -452,9 +452,10 @@ pub fn with_evm_context<F: FnOnce(&mut EvmContext<'_>, &mut EvmStack, &mut usize
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, spec_id, DEF_GAS_LIMIT);
 
     let mut host = TestHost::with_spec(spec_id);
+    let gas_params = host.gas_params.clone();
 
     let (mut ecx, stack, stack_len) =
-        EvmContext::from_interpreter_with_stack(&mut interpreter, &mut host);
+        EvmContext::from_interpreter_with_stack(&mut interpreter, &mut host, &gas_params);
     f(&mut ecx, stack, stack_len)
 }
 
