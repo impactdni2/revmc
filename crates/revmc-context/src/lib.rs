@@ -84,7 +84,7 @@ impl PartialEq<usize> for ResumeAt {
 pub struct BorrowedGasParams(ManuallyDrop<GasParams>);
 
 impl BorrowedGasParams {
-    #[inline]
+    #[inline(always)]
     fn new(gas_params: &GasParams) -> Self {
         // SAFETY: This bitwise copy is exposed only through `Deref`, never mutably, and is wrapped
         // in `ManuallyDrop`. The owning JIT EVM keeps the original `GasParams` alive for the
@@ -97,7 +97,7 @@ impl BorrowedGasParams {
 impl Deref for BorrowedGasParams {
     type Target = GasParams;
 
-    #[inline]
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
