@@ -8,7 +8,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::{
     fmt,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
+    ops::Deref,
     ptr::{self, NonNull},
 };
 use revm_interpreter::{
@@ -74,6 +75,34 @@ impl PartialEq<usize> for ResumeAt {
     }
 }
 
+/// Immutable, non-owning view of gas parameters held by the owning JIT EVM.
+///
+/// The private `ManuallyDrop` storage prevents safe mutation or replacement of the duplicated Arc
+/// handle. `EvmContext` construction ties its use to the lifetime of the owning snapshot.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct BorrowedGasParams(ManuallyDrop<GasParams>);
+
+impl BorrowedGasParams {
+    #[inline]
+    fn new(gas_params: &GasParams) -> Self {
+        // SAFETY: This bitwise copy is exposed only through `Deref`, never mutably, and is wrapped
+        // in `ManuallyDrop`. The owning JIT EVM keeps the original `GasParams` alive for the
+        // complete native call, so the shared Arc allocation remains valid without changing its
+        // reference count.
+        Self(ManuallyDrop::new(unsafe { ptr::read(gas_params) }))
+    }
+}
+
+impl Deref for BorrowedGasParams {
+    type Target = GasParams;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// The EVM bytecode compiler runtime context.
 ///
 /// This is a simple wrapper around the interpreter's resources, allowing the compiled function to
@@ -117,8 +146,8 @@ pub struct EvmContext<'a> {
     pub exit_result: InstructionResult,
     /// Saved RSP from the entry trampoline, used by [`revmc_exit`] to unwind.
     pub exit_sp: *mut u8,
-    /// Cached gas parameters borrowed from the owning EVM.
-    pub gas_params: &'a GasParams,
+    /// Cached gas parameters borrowed from the owning EVM without refcount traffic.
+    pub gas_params: BorrowedGasParams,
     /// Cached base pointer for the current memory context.
     /// Points to `memory[checkpoint..]`, i.e. the start of the current context's memory.
     /// Refreshed after any memory resize.
@@ -172,6 +201,7 @@ impl<'a> EvmContext<'a> {
         let (stack, stack_len) = EvmStack::from_interpreter_stack(&mut interpreter.stack);
         let bytecode = interpreter.bytecode.bytecode_slice() as *const [u8];
         let calldatasize = interpreter.input.input.len();
+        let gas_params = BorrowedGasParams::new(gas_params);
         let mut this = Self {
             memory: &mut interpreter.memory,
             input: &mut interpreter.input,
@@ -842,6 +872,7 @@ pub mod private {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
 
     #[test]
     fn conversions() {
@@ -849,6 +880,21 @@ mod tests {
         assert_eq!(usize::try_from(word), Ok(0));
         assert_eq!(usize::try_from(&word), Ok(0));
         assert_eq!(usize::try_from(&mut word), Ok(0));
+    }
+
+    #[test]
+    fn borrowed_gas_params_do_not_touch_the_arc_refcount() {
+        let table = Arc::new([0; 256]);
+        let gas_params = GasParams::new(Arc::clone(&table));
+        let baseline = Arc::strong_count(&table);
+
+        {
+            let borrowed = BorrowedGasParams::new(&gas_params);
+            assert_eq!(Arc::strong_count(&table), baseline);
+            assert!(core::ptr::eq(borrowed.table(), table.as_ref()));
+        }
+
+        assert_eq!(Arc::strong_count(&table), baseline);
     }
 
     extern_revmc! {
