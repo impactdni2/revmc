@@ -126,6 +126,13 @@ pub struct RuntimeConfig {
     /// Defaults to `false`.
     pub blocking: bool,
 
+    /// Callback invoked once on each compiler worker before it accepts jobs.
+    ///
+    /// Use this to configure worker affinity or priority independently of the backend thread.
+    /// Defaults to `None`.
+    #[debug(skip)]
+    pub on_worker_start: Option<Arc<dyn Fn() + Send + Sync>>,
+
     /// Callback invoked after each compilation completes (success or failure).
     ///
     /// Defaults to `None`.
@@ -242,6 +249,7 @@ impl Default for RuntimeConfig {
             jit_mode: JitMode::default(),
             jit_helper_path: None,
             blocking: false,
+            on_worker_start: None,
             on_compilation: None,
             on_artifact_usage: None,
         }

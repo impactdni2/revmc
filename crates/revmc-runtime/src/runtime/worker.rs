@@ -210,9 +210,15 @@ impl WorkerPool {
         let queue_capacity = worker_count.saturating_mul(config.tuning.jit_worker_queue_capacity);
         let out_of_process_helper = create_out_of_process_helper(&config, stats);
         let pool = (worker_count > 0).then(|| {
+            let on_worker_start = config.on_worker_start.clone();
             ThreadPoolBuilder::new()
                 .num_threads(worker_count)
                 .thread_name(|i| format!("revmc-{i:02}"))
+                .start_handler(move |_| {
+                    if let Some(callback) = &on_worker_start {
+                        callback();
+                    }
+                })
                 .exit_handler(|_| clear_thread_local_compilers())
                 .build()
                 .expect("failed to spawn compile workers")
@@ -288,6 +294,45 @@ impl WorkerPool {
     /// Resumes out-of-process helper execution.
     pub(crate) fn resume(&self) {
         resume_out_of_process_helper(&self.out_of_process_helper);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeTuning;
+    use std::{cell::Cell, thread};
+
+    #[test]
+    fn worker_start_precedes_jobs() {
+        const WORKERS: usize = 2;
+        thread_local! {
+            static STARTED: Cell<bool> = const { Cell::new(false) };
+        }
+        let starts = Arc::new(AtomicUsize::new(0));
+        let worker_starts = starts.clone();
+        let config = RuntimeConfig {
+            tuning: RuntimeTuning { jit_worker_count: WORKERS, ..Default::default() },
+            on_worker_start: Some(Arc::new(move || {
+                STARTED.set(true);
+                worker_starts.fetch_add(1, Ordering::Relaxed);
+            })),
+            ..Default::default()
+        };
+        let (result_tx, _) = chan::unbounded();
+        let workers = WorkerPool::new(result_tx, config, Arc::new(RuntimeStats::default()));
+
+        // Each job observes its own startup hook, while the creating thread stays untouched.
+        let results = workers.pool.as_ref().unwrap().broadcast(|context| {
+            assert_eq!(
+                thread::current().name(),
+                Some(format!("revmc-{:02}", context.index()).as_str())
+            );
+            STARTED.get()
+        });
+        assert_eq!(results, vec![true; WORKERS]);
+        assert_eq!(starts.load(Ordering::Relaxed), WORKERS);
+        assert!(!STARTED.get());
     }
 }
 
