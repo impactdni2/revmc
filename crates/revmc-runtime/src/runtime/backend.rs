@@ -25,7 +25,9 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use quanta::Instant;
 use std::{
+    collections::hash_map::DefaultHasher,
     ffi::CString,
+    hash::{Hash, Hasher},
     mem,
     ops::ControlFlow,
     sync::{Arc, atomic::Ordering},
@@ -45,6 +47,71 @@ pub(crate) type ResidentMap = DashMap<RuntimeCacheKey, Arc<CompiledProgram>, Def
 /// Producers (lookup hot path) push without blocking; on overflow the event is silently dropped
 /// (`stats.events_dropped` is bumped). Exact lookup counters are updated before enqueueing.
 pub(crate) type EventQueue = ArrayQueue<LookupRequest>;
+
+const ADMISSION_SKETCH_ROWS: usize = 4;
+const ADMISSION_SKETCH_MIN_WIDTH: usize = 64;
+const ADMISSION_SKETCH_WIDTH_MULTIPLIER: usize = 4;
+const ADMISSION_SKETCH_SAMPLE_MULTIPLIER: usize = 10;
+const ADMISSION_HASH_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Bounded, aging frequency estimator. It remembers one-off keys without retaining bytecode.
+struct AdmissionSketch {
+    counters: Vec<u16>,
+    width: usize,
+    additions: usize,
+    sample_size: usize,
+}
+
+impl AdmissionSketch {
+    fn new(capacity: usize) -> Self {
+        let sample_capacity = capacity.max(ADMISSION_SKETCH_MIN_WIDTH);
+        let width =
+            sample_capacity.saturating_mul(ADMISSION_SKETCH_WIDTH_MULTIPLIER).next_power_of_two();
+        Self {
+            counters: vec![0; width * ADMISSION_SKETCH_ROWS],
+            width,
+            additions: 0,
+            sample_size: sample_capacity.saturating_mul(ADMISSION_SKETCH_SAMPLE_MULTIPLIER),
+        }
+    }
+
+    fn observe(&mut self, key: RuntimeCacheKey, weight: u32) -> u32 {
+        if self.additions >= self.sample_size {
+            for counter in &mut self.counters {
+                *counter >>= 1;
+            }
+            self.additions >>= 1;
+        }
+        self.additions = self.additions.saturating_add(weight as usize);
+
+        let indexes = self.indexes(key);
+        let estimate = indexes.iter().map(|index| self.counters[*index]).min().unwrap_or(0);
+        let next = estimate.saturating_add(weight.min(u16::MAX as u32) as u16);
+        for index in indexes {
+            if self.counters[index] == estimate {
+                self.counters[index] = next;
+            }
+        }
+        next as u32
+    }
+
+    fn clear(&mut self) {
+        self.counters.fill(0);
+        self.additions = 0;
+    }
+
+    fn indexes(&self, key: RuntimeCacheKey) -> [usize; ADMISSION_SKETCH_ROWS] {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        std::array::from_fn(|row| {
+            let mixed = hash
+                .wrapping_add((row as u64).wrapping_mul(ADMISSION_HASH_STEP))
+                .rotate_left((row * 13) as u32);
+            row * self.width + (mixed as usize & (self.width - 1))
+        })
+    }
+}
 
 /// Per-entry metadata tracked alongside the resident map for eviction decisions.
 struct ResidentMeta {
@@ -85,6 +152,31 @@ enum AotAdmissionPlan {
     Oversized,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AotCapacity {
+    Fits,
+    NeedsEviction,
+    Oversized,
+}
+
+fn aot_capacity(
+    tuning: RuntimeTuning,
+    resident_aot_entries: usize,
+    resident_aot_bytes: usize,
+    candidate_len: usize,
+) -> AotCapacity {
+    if tuning.max_resident_aot_bytes > 0 && candidate_len > tuning.max_resident_aot_bytes {
+        return AotCapacity::Oversized;
+    }
+
+    let entries = resident_aot_entries.saturating_add(1);
+    let bytes = resident_aot_bytes.saturating_add(candidate_len);
+    let entries_fit =
+        tuning.max_resident_aot_entries == 0 || entries <= tuning.max_resident_aot_entries;
+    let bytes_fit = tuning.max_resident_aot_bytes == 0 || bytes <= tuning.max_resident_aot_bytes;
+    if entries_fit && bytes_fit { AotCapacity::Fits } else { AotCapacity::NeedsEviction }
+}
+
 /// Plans the minimum deterministic AOT eviction set needed for one admission.
 ///
 /// Artifact length is used as a stable budget proxy; it is not exact process RSS.
@@ -97,8 +189,10 @@ fn plan_aot_admission(
     mode: AdmitMode,
     mut residents: Vec<AotResident>,
 ) -> AotAdmissionPlan {
-    if tuning.max_resident_aot_bytes > 0 && candidate_len > tuning.max_resident_aot_bytes {
-        return AotAdmissionPlan::Oversized;
+    match aot_capacity(tuning, resident_aot_entries, resident_aot_bytes, candidate_len) {
+        AotCapacity::Fits => return AotAdmissionPlan::Admit(Vec::new()),
+        AotCapacity::Oversized => return AotAdmissionPlan::Oversized,
+        AotCapacity::NeedsEviction => {}
     }
 
     let entries_fit = |entries: usize| {
@@ -109,9 +203,6 @@ fn plan_aot_admission(
 
     let mut projected_entries = resident_aot_entries.saturating_add(1);
     let mut projected_bytes = resident_aot_bytes.saturating_add(candidate_len);
-    if entries_fit(projected_entries) && bytes_fit(projected_bytes) {
-        return AotAdmissionPlan::Admit(Vec::new());
-    }
 
     if mode == AdmitMode::Observed {
         residents
@@ -329,6 +420,12 @@ struct BackendState {
     entries: HashMap<RuntimeCacheKey, EntryState>,
     /// Number of entries created by observed misses.
     observed_entries: usize,
+    /// Approximate recent miss counts for keys whose bytecode is not retained yet.
+    admission_sketch: AdmissionSketch,
+    /// Reused scratch space for folding one miss drain by key.
+    miss_batch: HashMap<RuntimeCacheKey, (Bytes, u32)>,
+    /// Reused scratch space for ordering a folded miss drain.
+    miss_order: Vec<RuntimeCacheKey>,
     /// Number of resident AOT programs.
     resident_aot_entries: usize,
     /// Aggregate artifact-file bytes represented by resident AOT programs.
@@ -392,10 +489,45 @@ impl BackendState {
         // The separate queues prevent usage bookkeeping from displacing demand-load and
         // compilation signals. Cap each drain so a flood cannot starve commands, worker results,
         // or sweeps; surplus events stay queued for the next iteration.
+        let mut misses = mem::take(&mut self.miss_batch);
+        let mut order = mem::take(&mut self.miss_order);
+        let mut miss_count = 0usize;
         for _ in 0..self.tuning.max_events_per_drain {
             let Some(event) = self.inner.miss_events.pop() else { break };
-            self.handle_lookup_observed(event);
+            miss_count += 1;
+            misses
+                .entry(event.key)
+                .and_modify(|(_, count)| *count = count.saturating_add(1))
+                .or_insert((event.code, 1));
         }
+        self.inner
+            .stats
+            .miss_events_coalesced
+            .fetch_add(miss_count.saturating_sub(misses.len()) as u64, Ordering::Relaxed);
+
+        // Repeated keys represent the most immediately reusable work in this drain.
+        order.extend(misses.keys().copied());
+        order.sort_unstable_by(|left, right| {
+            misses[right]
+                .1
+                .cmp(&misses[left].1)
+                .then_with(|| left.code_hash.cmp(&right.code_hash))
+                .then_with(|| (left.spec_id as u8).cmp(&(right.spec_id as u8)))
+        });
+        for key in order.drain(..) {
+            let (code, observations) = misses.remove(&key).unwrap();
+            let kind = if self.aot { CompilationKind::Aot } else { CompilationKind::Jit };
+            self.try_admit(
+                kind,
+                key,
+                code,
+                SyncNotifier::none(),
+                AdmitMode::Observed,
+                observations,
+            );
+        }
+        self.miss_batch = misses;
+        self.miss_order = order;
         for _ in 0..self.tuning.max_events_per_drain {
             let Some(event) = self.inner.hit_events.pop() else { break };
             self.handle_lookup_observed(event);
@@ -411,7 +543,14 @@ impl BackendState {
             self.record_artifact_usage(event.key, self.tuning.lookup_hit_sample_rate as u64);
         } else {
             let kind = if self.aot { CompilationKind::Aot } else { CompilationKind::Jit };
-            self.try_admit(kind, event.key, event.code, SyncNotifier::none(), AdmitMode::Observed);
+            self.try_admit(
+                kind,
+                event.key,
+                event.code,
+                SyncNotifier::none(),
+                AdmitMode::Observed,
+                1,
+            );
         }
     }
 
@@ -434,7 +573,7 @@ impl BackendState {
 
     fn handle_compile_jit(&mut self, req: CompileJitRequest) {
         let kind = if self.aot { CompilationKind::Aot } else { CompilationKind::Jit };
-        self.try_admit(kind, req.key, req.bytecode, req.sync_notifier, AdmitMode::Explicit);
+        self.try_admit(kind, req.key, req.bytecode, req.sync_notifier, AdmitMode::Explicit, 0);
     }
 
     fn handle_prepare_aot(&mut self, reqs: Vec<PrepareAotRequest>) {
@@ -445,6 +584,7 @@ impl BackendState {
                 req.bytecode,
                 SyncNotifier::none(),
                 AdmitMode::Explicit,
+                0,
             );
         }
     }
@@ -461,6 +601,7 @@ impl BackendState {
         bytecode: Bytes,
         sync_notifier: SyncNotifier,
         mode: AdmitMode,
+        observations: u32,
     ) {
         if self.inner.resident.contains_key(&key) {
             sync_notifier.notify();
@@ -472,33 +613,79 @@ impl BackendState {
             return;
         }
 
-        let now = Instant::now();
-        if mode == AdmitMode::Observed {
-            let needs_observed_slot = self.entries.get(&key).is_none_or(|entry| !entry.observed);
-            if needs_observed_slot
-                && (self.tuning.max_observed_entries == 0
-                    || self.observed_entries >= self.tuning.max_observed_entries)
-            {
-                self.inner.stats.observed_entry_rejections.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+        if mode == AdmitMode::Observed && self.tuning.max_observed_entries == 0 {
+            self.inner
+                .stats
+                .observed_entry_rejections
+                .fetch_add(observations as u64, Ordering::Relaxed);
+            return;
         }
 
-        let entry = self.entries.entry(key).or_insert_with(|| EntryState {
-            hotness: 0,
-            phase: EntryPhase::Cold,
-            bytecode: bytecode.clone(),
-            last_observed_at: now,
-            pending_notifiers: Vec::new(),
-            persisted_aot: PersistedAotState::Unprobed,
-            observed: false,
-            working_mode: mode,
-        });
-        if mode == AdmitMode::Observed && !entry.observed {
-            entry.observed = true;
-            self.observed_entries += 1;
+        let now = Instant::now();
+        let new_entry = !self.entries.contains_key(&key);
+        let estimated_hotness = if mode == AdmitMode::Observed {
+            self.admission_sketch.observe(key, observations)
+        } else {
+            0
+        };
+        if new_entry
+            && mode == AdmitMode::Observed
+            && (estimated_hotness as usize) < self.tuning.observed_entry_hot_threshold
+        {
+            self.inner
+                .stats
+                .observed_entry_deferred
+                .fetch_add(observations as u64, Ordering::Relaxed);
+            return;
         }
-        entry.last_observed_at = now;
+
+        if new_entry {
+            let persisted_aot = if kind == CompilationKind::Aot
+                && (mode == AdmitMode::Explicit
+                    || (estimated_hotness as usize) >= self.tuning.persisted_aot_hot_threshold)
+            {
+                self.probe_persisted_aot(&key)
+            } else {
+                PersistedAotState::Unprobed
+            };
+            let persisted_ready = matches!(persisted_aot, PersistedAotState::Ready(_));
+            if mode == AdmitMode::Observed
+                && !persisted_ready
+                && self.observed_entries >= self.tuning.max_observed_entries
+            {
+                self.inner
+                    .stats
+                    .observed_entry_rejections
+                    .fetch_add(observations as u64, Ordering::Relaxed);
+                return;
+            }
+
+            let observed = mode == AdmitMode::Observed && !persisted_ready;
+            self.entries.insert(
+                key,
+                EntryState {
+                    hotness: estimated_hotness,
+                    phase: EntryPhase::Cold,
+                    bytecode,
+                    last_observed_at: now,
+                    pending_notifiers: Vec::new(),
+                    persisted_aot,
+                    observed,
+                    working_mode: mode,
+                },
+            );
+            if observed {
+                self.observed_entries += 1;
+            }
+        } else {
+            let entry = self.entries.get_mut(&key).unwrap();
+            if mode == AdmitMode::Observed {
+                entry.hotness = entry.hotness.saturating_add(observations);
+            }
+            entry.last_observed_at = now;
+        }
+
+        let entry = self.entries.get_mut(&key).unwrap();
 
         if entry.phase == EntryPhase::Working {
             if mode == AdmitMode::Explicit {
@@ -506,10 +693,6 @@ impl BackendState {
             }
             entry.pending_notifiers.push(sync_notifier);
             return;
-        }
-
-        if mode == AdmitMode::Observed {
-            entry.hotness = entry.hotness.saturating_add(1);
         }
 
         if kind == CompilationKind::Aot {
@@ -549,6 +732,22 @@ impl BackendState {
                             // compilation will overwrite it in the artifact store.
                             self.entries.get_mut(&key).unwrap().persisted_aot =
                                 PersistedAotState::Absent;
+
+                            if mode == AdmitMode::Observed
+                                && !self.entries.get(&key).unwrap().observed
+                            {
+                                if self.observed_entries >= self.tuning.max_observed_entries {
+                                    self.remove_entry(&key);
+                                    self.inner
+                                        .stats
+                                        .observed_entry_rejections
+                                        .fetch_add(observations as u64, Ordering::Relaxed);
+                                    sync_notifier.notify();
+                                    return;
+                                }
+                                self.entries.get_mut(&key).unwrap().observed = true;
+                                self.observed_entries += 1;
+                            }
                         }
                     }
                 }
@@ -655,33 +854,50 @@ impl BackendState {
         now: Instant,
         persisted_candidate: bool,
     ) -> AotAdmissionOutcome {
-        let residents = self
-            .resident_meta
-            .iter()
-            .filter(|(_, meta)| meta.kind == ProgramKind::Aot)
-            .map(|(key, meta)| AotResident {
-                key: *key,
-                last_hit_at: meta.last_hit_at,
-                artifact_len: meta.artifact_len,
-            })
-            .collect();
-        let victims = match plan_aot_admission(
+        let capacity = aot_capacity(
             self.tuning,
             self.resident_aot_entries,
             self.resident_aot_bytes,
             stored.manifest.artifact_len,
-            now,
-            mode,
-            residents,
-        ) {
-            AotAdmissionPlan::Admit(victims) => victims,
-            AotAdmissionPlan::CapacityDeferred => {
-                self.inner.stats.persisted_aot_capacity_deferred.fetch_add(1, Ordering::Relaxed);
-                return AotAdmissionOutcome::Deferred;
-            }
-            AotAdmissionPlan::Oversized => {
+        );
+        let victims = match capacity {
+            AotCapacity::Fits => Vec::new(),
+            AotCapacity::Oversized => {
                 self.inner.stats.persisted_aot_oversized.fetch_add(1, Ordering::Relaxed);
                 return AotAdmissionOutcome::Oversized;
+            }
+            AotCapacity::NeedsEviction => {
+                let residents = self
+                    .resident_meta
+                    .iter()
+                    .filter(|(_, meta)| meta.kind == ProgramKind::Aot)
+                    .map(|(key, meta)| AotResident {
+                        key: *key,
+                        last_hit_at: meta.last_hit_at,
+                        artifact_len: meta.artifact_len,
+                    })
+                    .collect();
+                match plan_aot_admission(
+                    self.tuning,
+                    self.resident_aot_entries,
+                    self.resident_aot_bytes,
+                    stored.manifest.artifact_len,
+                    now,
+                    mode,
+                    residents,
+                ) {
+                    AotAdmissionPlan::Admit(victims) => victims,
+                    AotAdmissionPlan::CapacityDeferred => {
+                        self.inner
+                            .stats
+                            .persisted_aot_capacity_deferred
+                            .fetch_add(1, Ordering::Relaxed);
+                        return AotAdmissionOutcome::Deferred;
+                    }
+                    AotAdmissionPlan::Oversized => {
+                        unreachable!("capacity precheck accepted artifact size")
+                    }
+                }
             }
         };
 
@@ -753,6 +969,7 @@ impl BackendState {
         self.resident_aot_entries = 0;
         self.resident_aot_bytes = 0;
         self.aot_load_limiter.reset();
+        self.admission_sketch.clear();
         // Notify any pending sync callers before clearing entries.
         for (_, entry) in self.entries.drain() {
             for n in entry.pending_notifiers {
@@ -1170,6 +1387,9 @@ pub(crate) fn run(
         resident_meta: preload_meta,
         entries: HashMap::default(),
         observed_entries: 0,
+        admission_sketch: AdmissionSketch::new(config.tuning.max_observed_entries),
+        miss_batch: HashMap::default(),
+        miss_order: Vec::new(),
         resident_aot_entries,
         resident_aot_bytes,
         aot_load_limiter: AotLoadLimiter::default(),
@@ -1279,6 +1499,30 @@ mod admission_policy_tests {
 
     fn resident(key: RuntimeCacheKey, last_hit_at: Instant, artifact_len: usize) -> AotResident {
         AotResident { key, last_hit_at, artifact_len }
+    }
+
+    #[test]
+    fn capacity_precheck_distinguishes_all_paths() {
+        let tuning = RuntimeTuning {
+            max_resident_aot_entries: 2,
+            max_resident_aot_bytes: 100,
+            ..Default::default()
+        };
+
+        assert_eq!(aot_capacity(tuning, 1, 40, 20), AotCapacity::Fits);
+        assert_eq!(aot_capacity(tuning, 2, 40, 20), AotCapacity::NeedsEviction);
+        assert_eq!(aot_capacity(tuning, 0, 0, 101), AotCapacity::Oversized);
+    }
+
+    #[test]
+    fn admission_sketch_counts_and_clears() {
+        let mut sketch = AdmissionSketch::new(64);
+        let target = key(1);
+
+        assert_eq!(sketch.observe(target, 2), 2);
+        assert_eq!(sketch.observe(target, 3), 5);
+        sketch.clear();
+        assert_eq!(sketch.observe(target, 1), 1);
     }
 
     #[test]

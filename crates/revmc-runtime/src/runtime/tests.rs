@@ -575,6 +575,7 @@ fn default_persisted_aot_tuning_preserves_legacy_behavior() {
     let tuning = RuntimeTuning::default();
 
     assert_eq!(tuning.max_observed_entries, tuning.jit_max_pending_jobs * 10);
+    assert_eq!(tuning.observed_entry_hot_threshold, 1);
     assert_eq!(tuning.max_resident_aot_entries, 0);
     assert_eq!(tuning.max_resident_aot_bytes, 0);
     assert_eq!(tuning.persisted_aot_hot_threshold, 1);
@@ -1074,7 +1075,7 @@ fn persisted_aot_probe_waits_for_threshold_and_caches_miss() {
 }
 
 #[test]
-fn saturated_observation_table_interprets_without_probing() {
+fn hot_batch_wins_saturated_observation_slot() {
     let store = Arc::new(CountingEmptyStore::default());
     let tb = TestBackend::new(RuntimeConfig {
         enabled: true,
@@ -1096,10 +1097,10 @@ fn saturated_observation_table_interprets_without_probing() {
         let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
     }
 
-    let stats = tb.wait_stats(|stats| stats.observed_entry_rejections >= 16);
+    let stats = tb.wait_stats(|stats| stats.observed_entry_rejections == 1);
     assert_eq!(stats.tracked_entries, 1);
-    assert_eq!(stats.persisted_aot_probes, 0);
-    assert_eq!(store.probes.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.persisted_aot_probes, 1);
+    assert_eq!(store.probes.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -1760,12 +1761,11 @@ fn cold_entries_are_evicted() {
         let _ = tb.lookup(TestBackend::req_cancun(&compile_me));
     }
     std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(tb.stats().resident_entries, 0);
+    assert_eq!(tb.stats().resident_entries, 1);
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let stats = tb.stats();
+    let stats = tb.wait_stats(|stats| stats.cold_entry_evictions >= 9);
     assert_eq!(stats.cold_entries, 0);
-    assert!(stats.cold_entry_evictions >= 10);
+    assert!(stats.cold_entry_evictions >= 9);
     tb.wait_compiled(&compile_me, SpecId::CANCUN);
 }
 
@@ -1818,8 +1818,48 @@ fn observed_entry_capacity_is_reported() {
 }
 
 #[test]
+fn admission_sketch_filters_one_off_entries() {
+    let tb = TestBackend::with_tuning(RuntimeTuning {
+        observed_entry_hot_threshold: 3,
+        jit_hot_threshold: usize::MAX,
+        jit_worker_count: 0,
+        idle_evict_duration: None,
+        cold_entry_idle_duration: None,
+        event_drain_interval: std::time::Duration::from_millis(1),
+        ..Default::default()
+    });
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_ADD));
+    tb.wait_stats(|stats| stats.observed_entry_deferred == 2);
+    assert_eq!(tb.stats().tracked_entries, 0);
+
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    let stats = tb.wait_stats(|stats| stats.tracked_entries == 1);
+    assert_eq!(stats.cold_entries, 1);
+}
+
+#[test]
+fn miss_drain_coalesces_repeated_keys() {
+    let tb = TestBackend::with_tuning(RuntimeTuning {
+        jit_hot_threshold: usize::MAX,
+        jit_worker_count: 0,
+        event_drain_interval: std::time::Duration::from_millis(100),
+        ..Default::default()
+    });
+
+    for _ in 0..32 {
+        let _ = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
+    }
+
+    let stats = tb.wait_stats(|stats| stats.lookup_misses == 32 && stats.miss_events_coalesced > 0);
+    assert!(stats.miss_events_coalesced >= 31);
+}
+
+#[test]
 #[cfg(feature = "llvm")]
-fn persisted_aot_respects_saturated_observed_entry_capacity() {
+fn persisted_aot_bypasses_saturated_observed_entry_capacity() {
     let store = Arc::new(RuntimeArtifactStore::new().unwrap());
     let code_hash = alloy_primitives::keccak256(BYTECODE_RET42);
     let tb = TestBackend::new(RuntimeConfig {
@@ -1855,18 +1895,16 @@ fn persisted_aot_respects_saturated_observed_entry_capacity() {
         let _ = tb.lookup(TestBackend::req_cancun(&indexed_bytecode(i)));
     }
     tb.wait_stats(|stats| stats.tracked_entries == 10);
-    let probes_after_fill = tb.stats().persisted_aot_probes;
-
     let first = tb.lookup(TestBackend::req_cancun(BYTECODE_RET42));
     assert!(matches!(first, LookupDecision::Interpret(_)));
-    tb.wait_stats(|stats| stats.observed_entry_rejections >= 1);
+    let compiled = tb.wait_compiled(BYTECODE_RET42, SpecId::CANCUN);
+    assert_eq!(compiled.kind, ProgramKind::Aot);
 
     let stats = tb.stats();
     assert_eq!(stats.tracked_entries, 10);
-    assert!(stats.observed_entry_rejections >= 1);
-    assert_eq!(stats.persisted_aot_probes, probes_after_fill);
+    assert_eq!(stats.observed_entry_rejections, 0);
     assert_eq!(stats.compilations_dispatched, dispatched_before);
-    assert!(tb.get_compiled(code_hash, SpecId::CANCUN).is_none());
+    assert!(tb.get_compiled(code_hash, SpecId::CANCUN).is_some());
 }
 
 // ===========================================================================

@@ -14,6 +14,10 @@ pub(crate) struct RuntimeStats {
     pub(crate) resident_lookup_locked: AtomicU64,
     /// Total lookup events dropped due to event-queue overflow.
     pub(crate) events_dropped: AtomicU64,
+    /// Total duplicate miss events folded into another event from the same drain.
+    pub(crate) miss_events_coalesced: AtomicU64,
+    /// Total miss observations kept only in the bounded admission sketch.
+    pub(crate) observed_entry_deferred: AtomicU64,
     /// Total observed entries rejected because the cold-entry tracking table was full.
     pub(crate) observed_entry_rejections: AtomicU64,
     /// Number of observed entries currently tracked for hotness or compilation.
@@ -95,6 +99,10 @@ pub struct RuntimeStatsSnapshot {
     pub resident_lookup_locked: u64,
     /// Total lookup events dropped due to event-queue overflow.
     pub events_dropped: u64,
+    /// Total duplicate miss events folded into another event from the same drain.
+    pub miss_events_coalesced: u64,
+    /// Total miss observations kept only in the bounded admission sketch.
+    pub observed_entry_deferred: u64,
     /// Total observed entries rejected because the cold-entry tracking table was full.
     pub observed_entry_rejections: u64,
     /// Number of observed entries currently tracked for hotness or compilation.
@@ -206,6 +214,8 @@ impl RuntimeStats {
             lookup_misses: self.lookup_misses.load(Ordering::Relaxed),
             resident_lookup_locked: self.resident_lookup_locked.load(Ordering::Relaxed),
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
+            miss_events_coalesced: self.miss_events_coalesced.load(Ordering::Relaxed),
+            observed_entry_deferred: self.observed_entry_deferred.load(Ordering::Relaxed),
             observed_entry_rejections: self.observed_entry_rejections.load(Ordering::Relaxed),
             tracked_entries: self.tracked_entries.load(Ordering::Relaxed),
             cold_entries: self.cold_entries.load(Ordering::Relaxed),

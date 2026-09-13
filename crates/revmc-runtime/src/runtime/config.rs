@@ -286,6 +286,11 @@ pub struct RuntimeTuning {
     /// `jit_max_pending_jobs * 10` bound.
     pub max_observed_entries: usize,
 
+    /// Number of misses estimated by the bounded admission sketch before retaining bytecode and
+    /// exact per-key state. Values above one prevent one-off contracts from filling the observed
+    /// entry table. Defaults to `1`.
+    pub observed_entry_hot_threshold: usize,
+
     /// Maximum delay between lookup observation and hotness accounting.
     ///
     /// Defaults to `100ms`.
@@ -451,6 +456,7 @@ impl Default for RuntimeTuning {
             max_events_per_drain: 4096,
             lookup_hit_sample_rate: 1,
             max_observed_entries: 20480,
+            observed_entry_hot_threshold: 1,
             event_drain_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             jit_hot_threshold: 8,
