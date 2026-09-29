@@ -4,7 +4,9 @@
 //! execution to look up compiled functions via [`JitBackend`] before falling
 //! back to the interpreter.
 
-use crate::runtime::{JitBackend, LookupDecision, LookupRequest, RuntimeCacheKey};
+use crate::runtime::{
+    CallPhase, ExecutionBackend, JitBackend, LookupDecision, LookupRequest, RuntimeCacheKey,
+};
 use alloy_primitives::{Address, Bytes};
 use revm_context::{Host, JournalEntry};
 use revm_context_interface::{
@@ -23,7 +25,10 @@ use revm_inspector::{
     InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector, InspectorEvmTr, InspectorFrame,
     InspectorHandler, JournalExt,
 };
-use revm_interpreter::{InstructionResult, InterpreterAction, InterpreterResult, InterpreterTypes};
+use revm_interpreter::{
+    InstructionResult, InterpreterAction, InterpreterResult, InterpreterTypes,
+    interpreter_types::Jumps,
+};
 use revm_primitives::{B256Map, hardfork::SpecId};
 use revm_state::EvmState;
 use std::sync::Arc;
@@ -196,12 +201,16 @@ where
         let spec_id: SpecId = self.inner.ctx_ref().cfg().spec().into();
         let frame = self.inner.frame_stack().get();
         let code_hash = frame.interpreter.bytecode.get_or_calculate_hash();
+        let phase =
+            if frame.interpreter.bytecode.pc() == 0 { CallPhase::Start } else { CallPhase::Resume };
 
         let decision = self.lookup_cache.entry(code_hash).or_insert_with(|| {
             let code = frame.interpreter.bytecode.original_bytes();
             self.backend.lookup(LookupRequest { key: RuntimeCacheKey { code_hash, spec_id }, code })
         });
 
+        // Time one segment through suspension/return, so child frames are never counted twice.
+        let _sample = self.backend.sample_execution(ExecutionBackend::from(&*decision), phase);
         Ok(match decision {
             LookupDecision::Compiled(program) => {
                 let gas_params = &self.gas_params;
@@ -372,12 +381,16 @@ where
         let spec_id: SpecId = self.inner.ctx_ref().cfg().spec().into();
         let frame = self.inner.frame_stack().get();
         let code_hash = frame.interpreter.bytecode.get_or_calculate_hash();
+        let phase =
+            if frame.interpreter.bytecode.pc() == 0 { CallPhase::Start } else { CallPhase::Resume };
 
         let decision = self.lookup_cache.entry(code_hash).or_insert_with(|| {
             let code = frame.interpreter.bytecode.original_bytes();
             self.backend.lookup(LookupRequest { key: RuntimeCacheKey { code_hash, spec_id }, code })
         });
 
+        // Inspector execution uses the same sampling population as ordinary execution.
+        let _sample = self.backend.sample_execution(ExecutionBackend::from(&*decision), phase);
         let program = match decision {
             LookupDecision::Compiled(program) => Arc::clone(program),
             LookupDecision::Interpret(_) => return self.inner.inspect_frame_run(),
@@ -526,6 +539,7 @@ mod tests {
     };
     use revm_database::{CacheDB, EmptyDB};
     use revm_handler::MainBuilder;
+    use revm_inspector::NoOpInspector;
 
     fn blocking_backend() -> JitBackend {
         JitBackend::new(RuntimeConfig { blocking: true, ..Default::default() }).unwrap()
@@ -617,6 +631,56 @@ mod tests {
             ..Default::default()
         };
         evm.transact(tx).unwrap().result
+    }
+
+    #[test]
+    fn samples_cached_frames() {
+        use crate::runtime::execution::with_all_samples;
+
+        for backend in [JitBackend::disabled(), blocking_backend()] {
+            let mut evm = test_jit_evm(backend.clone());
+            let inner = deploy_contract_with_nonce(&mut evm, &[op::STOP], 0);
+            // The parent suspends for a child call, then resumes: two calls, three segments.
+            let mut code = vec![op::PUSH0; 5];
+            code.push(op::PUSH20);
+            code.extend_from_slice(inner.as_slice());
+            code.extend_from_slice(&[op::PUSH2, 0xff, 0xff, op::CALL, op::STOP]);
+            let outer = deploy_contract_with_nonce(&mut evm, &code, 1);
+            let tx = TxEnv {
+                kind: TxKind::Call(outer),
+                nonce: 2,
+                gas_limit: 1_000_000,
+                ..Default::default()
+            };
+
+            let mut evm =
+                JitEvm::new(evm.into_inner().with_inspector(NoOpInspector), backend.clone());
+
+            // Warm the lookup cache before measuring both regular and inspector dispatch.
+            assert!(evm.transact(tx.clone()).unwrap().result.is_success());
+            let before = backend.stats();
+            with_all_samples(|| {
+                assert!(evm.transact(tx.clone()).unwrap().result.is_success());
+                assert!(evm.inspect_one_tx(tx).unwrap().is_success());
+            });
+            let after = backend.stats();
+            assert_eq!(after.lookup_hits, before.lookup_hits);
+            assert_eq!(after.lookup_misses, before.lookup_misses);
+            if after.resident_entries > 0 {
+                assert_eq!(after.sampled_compiled_calls - before.sampled_compiled_calls, 4);
+                assert_eq!(after.sampled_compiled_segments - before.sampled_compiled_segments, 6);
+                assert!(after.sampled_compiled_ns > before.sampled_compiled_ns);
+                assert_eq!(after.sampled_interpreter_segments, before.sampled_interpreter_segments);
+            } else {
+                assert_eq!(after.sampled_interpreter_calls - before.sampled_interpreter_calls, 4);
+                assert_eq!(
+                    after.sampled_interpreter_segments - before.sampled_interpreter_segments,
+                    6
+                );
+                assert!(after.sampled_interpreter_ns > before.sampled_interpreter_ns);
+                assert_eq!(after.sampled_compiled_segments, before.sampled_compiled_segments);
+            }
+        }
     }
 
     #[test]
