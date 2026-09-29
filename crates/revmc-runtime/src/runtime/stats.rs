@@ -9,6 +9,18 @@ pub(crate) struct RuntimeStats {
     pub(crate) lookup_hits: AtomicU64,
     /// Total lookups that returned interpret (not ready).
     pub(crate) lookup_misses: AtomicU64,
+    /// Sampled compiled call/create frame starts (not resumptions).
+    pub(crate) sampled_compiled_calls: AtomicU64,
+    /// Sampled interpreter call/create frame starts (not resumptions).
+    pub(crate) sampled_interpreter_calls: AtomicU64,
+    /// Sampled compiled execution segments, including resumptions.
+    pub(crate) sampled_compiled_segments: AtomicU64,
+    /// Sampled interpreter execution segments, including resumptions.
+    pub(crate) sampled_interpreter_segments: AtomicU64,
+    /// Wall nanoseconds in sampled compiled segments; excludes child execution.
+    pub(crate) sampled_compiled_ns: AtomicU64,
+    /// Wall nanoseconds in sampled interpreter segments; excludes child execution.
+    pub(crate) sampled_interpreter_ns: AtomicU64,
     /// Total resident lookups that fell back to interpretation because the
     /// target DashMap shard was locked.
     pub(crate) resident_lookup_locked: AtomicU64,
@@ -95,6 +107,18 @@ pub struct RuntimeStatsSnapshot {
     pub lookup_hits: u64,
     /// Total lookups that returned interpret (not ready).
     pub lookup_misses: u64,
+    /// Sampled compiled call/create frame starts (not resumptions).
+    pub sampled_compiled_calls: u64,
+    /// Sampled interpreter call/create frame starts (not resumptions).
+    pub sampled_interpreter_calls: u64,
+    /// Sampled compiled execution segments, including resumptions.
+    pub sampled_compiled_segments: u64,
+    /// Sampled interpreter execution segments, including resumptions.
+    pub sampled_interpreter_segments: u64,
+    /// Wall nanoseconds in sampled compiled segments; excludes child execution.
+    pub sampled_compiled_ns: u64,
+    /// Wall nanoseconds in sampled interpreter segments; excludes child execution.
+    pub sampled_interpreter_ns: u64,
     /// Total resident lookups that encountered a locked DashMap shard.
     pub resident_lookup_locked: u64,
     /// Total lookup events dropped due to event-queue overflow.
@@ -212,6 +236,12 @@ impl RuntimeStats {
         RuntimeStatsSnapshot {
             lookup_hits: self.lookup_hits.load(Ordering::Relaxed),
             lookup_misses: self.lookup_misses.load(Ordering::Relaxed),
+            sampled_compiled_calls: self.sampled_compiled_calls.load(Ordering::Relaxed),
+            sampled_interpreter_calls: self.sampled_interpreter_calls.load(Ordering::Relaxed),
+            sampled_compiled_segments: self.sampled_compiled_segments.load(Ordering::Relaxed),
+            sampled_interpreter_segments: self.sampled_interpreter_segments.load(Ordering::Relaxed),
+            sampled_compiled_ns: self.sampled_compiled_ns.load(Ordering::Relaxed),
+            sampled_interpreter_ns: self.sampled_interpreter_ns.load(Ordering::Relaxed),
             resident_lookup_locked: self.resident_lookup_locked.load(Ordering::Relaxed),
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
             miss_events_coalesced: self.miss_events_coalesced.load(Ordering::Relaxed),

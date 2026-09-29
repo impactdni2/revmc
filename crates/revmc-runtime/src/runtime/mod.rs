@@ -38,6 +38,10 @@ pub use config::{
 
 mod backend;
 
+pub(crate) mod execution;
+pub use execution::EXECUTION_SAMPLE_RATE;
+pub(crate) use execution::{CallPhase, ExecutionBackend};
+
 mod stats;
 pub use stats::RuntimeStatsSnapshot;
 
